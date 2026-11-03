@@ -115,8 +115,9 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <h2>Heading corrections</h2>
   <div class="row"><label for="decl">Magnetic declination (° east +)</label><input id="decl" type="number" step="0.1" value="0"></div>
   <div class="row"><span>Landmark calibration offset</span><span id="calShow" class="mono">az +0.0° · el +0.0°</span></div>
+  <div class="row"><label for="lockNorth">Ignore compass after calibrating (gyro only)</label><input id="lockNorth" type="checkbox" checked></div>
   <div class="row"><button id="btnCalReset">Clear calibration</button></div>
-  <p class="note">Phone compasses report magnetic north and are often off by a few degrees. Calibrating on a landmark you can identify on the map absorbs both, and replaces the declination value above.</p>
+  <p class="note">Turning is always measured by the gyro. The compass only sets north, slowly. Magnetic cases, mounts and car dashboards distort it; calibrating on a landmark you can identify on the map fixes north, and with the option above the compass is then ignored until you clear calibration. Recalibrate if the heading creeps after several minutes.</p>
 
   <h2>View</h2>
   <div class="row"><label for="camOn">Camera behind reticle</label><input id="camOn" type="checkbox" checked></div>
@@ -252,26 +253,52 @@ function deviceAxes(a, b, g){
     [ca*sg + sa*sb*cg, sa*sg - ca*sb*cg, cb*cg],
   ];
 }
-function onOrient(e, kind){
-  if (e.beta == null) return;
-  let ax;
-  if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading) && e.alpha != null){
-    // iOS: alpha/beta/gamma come from the gyro in an arbitrary heading frame. Use them for all motion,
-    // and use the compass only as a slowly filtered offset from that frame to north. Substituting the
-    // compass into alpha double-counts yaw when the phone is upright (Euler degeneracy near beta = 90°).
-    kind = "iOS compass";
-    ax = deviceAxes(e.alpha, e.beta, e.gamma);
-    const back = ax[2].map(c => -c);
-    const ref = Math.abs(back[2]) < 0.8 ? back : ax[1];      // upright: camera direction; flat: top of phone
-    const azRaw = Math.atan2(ref[0], ref[1])*R2D;
-    const diff = ((e.webkitCompassHeading - azRaw + 540) % 360) - 180;
-    if (S.iosOff == null) S.iosOff = diff;
-    else S.iosOff += 0.03*(((diff - S.iosOff + 540) % 360) - 180);
-    const d = S.iosOff*D2R, c = Math.cos(d), s = Math.sin(d);
-    ax = ax.map(([x, y, z]) => [x*c + y*s, y*c - x*s, z]);
+/* Heading model: all motion comes from the gyro-based (relative) orientation, which magnets cannot distort.
+   The compass only supplies a slowly filtered offset from that frame to north, and that offset can be frozen
+   after a landmark calibration so the compass is ignored entirely. */
+const wrap180 = a => ((a + 540) % 360) - 180;
+function refAz(ax){
+  const back = ax[2].map(c => -c);
+  const ref = Math.abs(back[2]) < 0.8 ? back : ax[1];        // upright: camera direction; flat: top of phone
+  return Math.atan2(ref[0], ref[1])*R2D;
+}
+function rotYaw(ax, deg){
+  const d = deg*D2R, c = Math.cos(d), s = Math.sin(d);
+  return ax.map(([x, y, z]) => [x*c + y*s, y*c - x*s, z]);
+}
+function fuse(rawAx, compassAz){
+  if (compassAz != null && !S.northLocked){
+    const diff = wrap180(compassAz - refAz(rawAx));
+    const now = performance.now();
+    if (S.northOff == null) S.northOff = diff;
+    else S.northOff += Math.min(1, (now - (S.fuseT || now))/15000)*wrap180(diff - S.northOff);   // ~15 s time constant
+    S.fuseT = now;
   }
-  else if (kind === "absolute" || e.absolute) ax = deviceAxes(e.alpha, e.beta, e.gamma);
-  else { S.kind = "relative only"; updateChips(); return; }
+  return S.northOff == null ? null : rotYaw(rawAx, S.northOff);
+}
+function onAbsolute(e){                       // Android: compass-referenced orientation, used only for north
+  if (e.alpha == null || e.beta == null) return;
+  S.absAz = refAz(deviceAxes(e.alpha, e.beta, e.gamma)); S.absAt = performance.now();
+  if (!S.relSeen) applyAxes(deviceAxes(e.alpha, e.beta, e.gamma), "compass only");   // fallback: no gyro stream
+}
+function onOrient(e){
+  if (e.beta == null || e.alpha == null) return;
+  let ax, kind;
+  if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading)){
+    ax = fuse(deviceAxes(e.alpha, e.beta, e.gamma), e.webkitCompassHeading); kind = "iOS";
+  } else if (e.absolute){
+    if (!("ondeviceorientationabsolute" in window)) applyAxes(deviceAxes(e.alpha, e.beta, e.gamma), "compass only");
+    return;
+  } else {
+    S.relSeen = true;
+    const fresh = S.absAt && performance.now() - S.absAt < 1000;
+    ax = fuse(deviceAxes(e.alpha, e.beta, e.gamma), fresh ? S.absAz : null); kind = "Android";
+    if (!ax){ S.kind = "waiting for compass"; updateChips(); return; }
+  }
+  if (!ax) return;
+  applyAxes(ax, kind + (S.northLocked ? " · gyro, north locked" : " · gyro + compass"));
+}
+function applyAxes(ax, kind){
   S.kind = kind;
   if (!S.axes) S.axes = ax;
   else for (let j = 0; j < 3; j++){
@@ -300,8 +327,8 @@ async function start(){
       if (r !== "granted") toast("Motion access was denied. Allow it in Safari settings for this site, or use Simulate.");
     }
   } catch(e){ toast("Motion permission failed: " + e.message); }
-  if ("ondeviceorientationabsolute" in window) addEventListener("deviceorientationabsolute", e => onOrient(e, "absolute"));
-  else addEventListener("deviceorientation", e => onOrient(e, "device"));
+  if ("ondeviceorientationabsolute" in window) addEventListener("deviceorientationabsolute", onAbsolute);
+  addEventListener("deviceorientation", onOrient);
   if ("geolocation" in navigator){
     navigator.geolocation.watchPosition(p => {
       if ($("sim").checked) return;
@@ -565,8 +592,8 @@ function updateChips(){
   else if (S.pos){ g.textContent = `GPS ±${Math.round(S.acc || 0)} m`; g.className = "chip " + (S.acc < 15 ? "ok" : "warn"); }
   const c = $("chipCmp");
   if ($("sim").checked){ c.textContent = "Compass SIM"; c.className = "chip warn"; }
-  else if (S.vec){ c.textContent = S.kind; c.className = "chip " + (S.kind === "relative only" ? "bad" : "ok"); }
-  else if (S.kind === "relative only"){ c.textContent = "No north ref"; c.className = "chip bad"; }
+  else if (S.vec){ c.textContent = S.kind; c.className = "chip " + (/compass only|waiting/.test(S.kind) ? "warn" : "ok"); }
+  else if (S.kind === "waiting for compass"){ c.textContent = "Waiting for compass"; c.className = "chip warn"; }
   $("chipDem").textContent = `DEM z${dem.z} · ${dem.loaded}`;
   const a = $("chipAr"); a.hidden = !$("arOn").checked;
   a.textContent = AR.status === "loading" ? "AR loading" : AR.status === "error" ? "AR error" : `AR ${AR.ways.length} roads`;
@@ -590,6 +617,7 @@ $("bannerSet").onclick = () => {
   const trueEl = Math.atan2(T - h0 - (1 - k)*d*d/(2*RE), d)*R2D;
   S.cal = { az:((brg - m.az + 540) % 360) - 180, el:trueEl - m.el };
   try { localStorage.setItem("sightline.cal", JSON.stringify(S.cal)); } catch(e){}
+  if ($("lockNorth").checked && !$("sim").checked) S.northLocked = true;
   S.calMode = 0; gCal.remove();
   toast(`Calibrated: az ${S.cal.az.toFixed(1)}°, el ${S.cal.el.toFixed(2)}° (landmark ${fmtKm(d)} away).`);
   updateChips();
@@ -606,7 +634,7 @@ $("btnCal").onclick = () => {
 };
 $("btnMore").onclick = () => { showResult(); $("sheet").hidden = false; };
 $("btnClose").onclick = () => { $("sheet").hidden = true; };
-$("btnCalReset").onclick = () => { S.cal = { az:0, el:0 }; try { localStorage.removeItem("sightline.cal"); } catch(e){} updateChips(); };
+$("btnCalReset").onclick = () => { S.cal = { az:0, el:0 }; S.northLocked = false; try { localStorage.removeItem("sightline.cal"); } catch(e){} updateChips(); };
 $("decl").onchange = () => { try { localStorage.setItem("sightline.decl", $("decl").value); } catch(e){} };
 $("range").onchange = () => {
   const z = demZoomFor(+$("range").value);

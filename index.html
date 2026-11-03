@@ -83,6 +83,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div id="roAngles" class="ro">
     <div><span class="lbl">Az</span> <span id="az" class="big">—</span></div>
     <div><span class="lbl">El</span> <span id="el" class="big">—</span></div>
+    <div><span class="lbl">H</span> <span id="hgt" class="big">—</span> <span id="hsrc" class="lbl"></span></div>
   </div>
   <div id="locked" hidden>LOCKED</div>
   <div id="roResult" class="ro"><span id="headline">Press Start, then aim the crosshair at the ground point.</span></div>
@@ -387,7 +388,11 @@ const rangeM = () => (+$("range").value)*1000;
 
 /* ---------- main loop ---------- */
 function observerHeight(){
-  if ($("useGpsAlt").checked && S.gpsAlt != null) return S.gpsAlt;
+  if (!S.pos) return null;
+  if ($("useGpsAlt").checked){
+    if (S.gpsAlt != null){ S.hSrc = "GPS"; return S.gpsAlt; }
+    S.hSrc = "DEM (no GPS alt)";
+  } else S.hSrc = "DEM + " + (+$("eye").value || 0) + " m";
   const g = elevAt(S.pos[0], S.pos[1]);
   return g === null ? null : g + (+$("eye").value || 0);
 }
@@ -396,6 +401,12 @@ function fmtKm(d){ return d < 1000 ? d.toFixed(0) + " m" : (d/1000).toFixed(d < 
 function tick(){
   const c = corrected();
   if (c){ $("az").textContent = c.az.toFixed(1) + "°"; $("el").textContent = (c.el >= 0 ? "+" : "") + c.el.toFixed(2) + "°"; }
+  if (S.pos && !S.locked){
+    const hh = observerHeight();
+    $("hgt").textContent = hh === null ? "—" : hh.toFixed(0) + " m";
+    $("hsrc").textContent = S.hSrc || "";
+    $("hsrc").style.color = /no GPS/.test(S.hSrc) ? "var(--warn)" : "";
+  }
   if (S.locked || !c || !S.pos){ updateChips(); return; }
   const h0 = observerHeight();
   if (h0 === null){ $("headline").textContent = "Loading elevation data…"; return; }
@@ -480,12 +491,12 @@ async function loadStreets(){
   } catch(e){ AR.status = "error"; toast("Street data failed: " + e.message); }
   AR.loading = false; updateChips();
 }
-/* world position (ENU metres relative to the observer, curvature folded into Up) and terrain visibility per vertex.
-   Visibility depends only on observer and point, so it is computed once per location, in batches. */
+/* Per vertex: road-surface height (p.g) and terrain visibility. Screen positions are recomputed every frame from
+   the current position and observer height; visibility is recomputed when position, height or refraction change. */
 function computeVisibility(){
   const h0 = observerHeight(); if (h0 === null){ setTimeout(computeVisibility, 500); return; }
   const k = +$("refr").value || 0, curv = (1 - k)/(2*RE), obs = S.pos.slice(), cosL = Math.cos(obs[0]*D2R);
-  AR.visOrigin = obs;
+  AR.visOrigin = obs; AR.visH0 = h0; AR.visK = k;
   const all = []; AR.ways.forEach(w => w.pts.forEach(p => all.push(p)));
   const job = ++AR.visQueue; let i = 0;
   (function batch(){
@@ -495,7 +506,7 @@ function computeVisibility(){
       const p = all[i], T = elevAt(p.lat, p.lon);
       const e = (p.lon - obs[1])*D2R*RE*cosL, n = (p.lat - obs[0])*D2R*RE, d = Math.hypot(e, n);
       const g = (T === null ? h0 - (+$("eye").value || 0) : T) + 0.5;   // half a metre above the road surface
-      p.w = [e, n, g - h0 - curv*d*d];
+      p.g = g;
       if (d < 30) { p.vis = true; continue; }
       const ang = Math.atan2(g - h0 - curv*d*d, d)*R2D, brg = norm360(Math.atan2(e, n)*R2D);
       const r = castRay(obs, h0, brg, ang, d - 25, k, elevAt);
@@ -522,7 +533,13 @@ function drawAR(){
   if (arCv.width !== Math.round(W*dpr) || arCv.height !== Math.round(H*dpr)){ arCv.width = Math.round(W*dpr); arCv.height = Math.round(H*dpr); }
   arCx.setTransform(dpr, 0, 0, dpr, 0, 0); arCx.clearRect(0, 0, W, H);
   if (!$("arOn").checked || !AR.ways.length) return;
-  const A = viewAxes(); if (!A) return;
+  const A = viewAxes(); if (!A || !S.pos) return;
+  const h0 = observerHeight(); if (h0 === null) return;
+  const curv = (1 - (+$("refr").value || 0))/(2*RE), lat0 = S.pos[0], lon0 = S.pos[1], cosL = Math.cos(lat0*D2R);
+  const worldOf = p => {
+    const e = (p.lon - lon0)*D2R*RE*cosL, n = (p.lat - lat0)*D2R*RE;
+    return [e, n, p.g - h0 - curv*(e*e + n*n)];
+  };
   // focal length in CSS px: FOV spans the long side of the displayed (cover-scaled) camera frame
   const v = $("cam"); let L = Math.max(W, H);
   if (!v.hidden && v.videoWidth){ const s = Math.max(W/v.videoWidth, H/v.videoHeight); L = Math.max(v.videoWidth, v.videoHeight)*s; }
@@ -550,9 +567,9 @@ function drawAR(){
       arCx.beginPath(); let pen = false;
       for (let i = 0; i < w.pts.length - 1; i++){
         const a = w.pts[i], b = w.pts[i+1];
-        if (!a.w || !b.w || a.vis === undefined) { pen = false; continue; }
+        if (a.g === undefined || b.g === undefined || a.vis === undefined || b.vis === undefined) { pen = false; continue; }
         if ((a.vis && b.vis) !== !!pass){ pen = false; continue; }
-        let pa = toCam(a.w), pb = toCam(b.w);
+        let pa = toCam(worldOf(a)), pb = toCam(worldOf(b));
         const near = 2;
         if (pa[2] < near && pb[2] < near){ pen = false; continue; }
         if (pa[2] < near){ const t = (near - pa[2])/(pb[2] - pa[2]); pa = pa.map((x, k) => x + t*(pb[k] - x)); pen = false; }
@@ -581,8 +598,13 @@ requestAnimationFrame(drawAR);
 function maybeReloadStreets(){
   if (!$("arOn").checked || !S.pos) return;
   if (!AR.origin || distBear(AR.origin, S.pos)[0] > +$("arRad").value*0.25) loadStreets();
-  else if (!AR.loading && AR.visOrigin && distBear(AR.visOrigin, S.pos)[0] > 30) computeVisibility();
+  else if (!AR.loading && AR.visOrigin){
+    const h0 = observerHeight();
+    if (distBear(AR.visOrigin, S.pos)[0] > 30 || (h0 !== null && Math.abs(h0 - AR.visH0) > 2) || (+$("refr").value || 0) !== AR.visK)
+      computeVisibility();
+  }
 }
+["eye", "useGpsAlt", "refr"].forEach(id => $(id).addEventListener("change", maybeReloadStreets));
 setInterval(maybeReloadStreets, 3000);
 
 /* ---------- UI ---------- */

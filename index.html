@@ -492,16 +492,44 @@ function roadClass(h){
   if (/^(path|footway|cycleway|track|steps|bridleway)$/.test(h)) return "path";
   return "minor";
 }
+/* Public Overpass servers; the main one often answers 502/503/504 or 429 under load. Try each in turn,
+   starting with whichever worked last. */
+const OVERPASS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+];
+async function overpass(q){
+  let start = 0; try { start = Math.max(0, OVERPASS.indexOf(localStorage.getItem("sightline.overpass"))); } catch(e){}
+  const errs = [];
+  for (let k = 0; k < OVERPASS.length; k++){
+    const url = OVERPASS[(start + k) % OVERPASS.length], host = new URL(url).host;
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 30000);
+    try {
+      AR.status = "loading"; AR.server = host; updateChips();
+      const res = await fetch(url, { method:"POST", body:"data=" + encodeURIComponent(q), signal:ctl.signal,
+        headers:{ "Content-Type":"application/x-www-form-urlencoded" } });
+      if (!res.ok) throw new Error(String(res.status));
+      const js = await res.json();
+      if (!js || !Array.isArray(js.elements)) throw new Error("bad response");
+      if (js.remark && /runtime error|timed out/i.test(js.remark) && !js.elements.length) throw new Error("server timeout");
+      try { localStorage.setItem("sightline.overpass", url); } catch(e){}
+      return js;
+    } catch(e){
+      errs.push(host + " " + (e.name === "AbortError" ? "timeout" : e.message));
+    } finally { clearTimeout(timer); }
+  }
+  AR.serverErrs = errs;
+  throw new Error(errs.map(s => s.split(" ").pop()).join("/"));
+}
 async function loadStreets(){
   if (!S.pos || AR.loading) return;
   AR.loading = true; AR.status = "loading"; updateChips();
   const r = +$("arRad").value, [lat, lon] = S.pos;
   const q = `[out:json][timeout:25];way(around:${r},${lat},${lon})[highway~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|track|path|footway|cycleway|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"];out geom;`;
   try {
-    const res = await fetch("https://overpass-api.de/api/interpreter", { method:"POST", body:"data=" + encodeURIComponent(q),
-      headers:{ "Content-Type":"application/x-www-form-urlencoded" } });
-    if (!res.ok) throw new Error("Overpass returned " + res.status);
-    const js = await res.json();
+    const js = await overpass(q);
     await preload(lat, lon, r + 500);
     AR.origin = [lat, lon];
     AR.ways = js.elements.filter(w => w.geometry && w.geometry.length > 1).map(w => {
@@ -515,8 +543,14 @@ async function loadStreets(){
       return { name:(w.tags && w.tags.name) || "", cls:roadClass(w.tags.highway), pts };
     });
     computeVisibility();
-    AR.status = "ok";
-  } catch(e){ AR.status = "error"; toast("Street data failed: " + e.message); }
+    AR.status = "ok"; AR.fails = 0; AR.retryAt = 0; AR.lastErr = null;
+  } catch(e){
+    // keep any streets already on screen; back off 10 s, 20 s, 40 s … up to 2 min before the next attempt
+    AR.fails = (AR.fails || 0) + 1; AR.lastErr = e.message;
+    AR.retryAt = Date.now() + Math.min(120000, 10000*2**(AR.fails - 1));
+    AR.status = AR.ways.length ? "stale" : "error";
+    if (AR.fails === 1) toast("Street servers busy (" + e.message + "). Retrying automatically.");
+  }
   AR.loading = false; updateChips();
 }
 /* Per vertex: road-surface height (p.g) and terrain visibility. Screen positions are recomputed every frame from
@@ -625,7 +659,8 @@ function drawAR(){
 requestAnimationFrame(drawAR);
 function maybeReloadStreets(){
   if (!$("arOn").checked || !S.pos) return;
-  if (!AR.origin || distBear(AR.origin, S.pos)[0] > +$("arRad").value*0.25) loadStreets();
+  const need = !AR.origin || distBear(AR.origin, S.pos)[0] > +$("arRad").value*0.25;
+  if (need && !AR.loading && Date.now() >= (AR.retryAt || 0)) loadStreets();
   else if (!AR.loading && AR.visOrigin){
     const h0 = observerHeight();
     if (distBear(AR.visOrigin, S.pos)[0] > 30 || (h0 !== null && Math.abs(h0 - AR.visH0) > 2) || (+$("refr").value || 0) !== AR.visK)
@@ -646,7 +681,10 @@ function updateChips(){
   else if (S.kind === "waiting for compass"){ c.textContent = "Waiting for compass"; c.className = "chip warn"; }
   $("chipDem").textContent = `DEM z${dem.z} · ${dem.loaded}`;
   const a = $("chipAr"); a.hidden = !$("arOn").checked;
-  a.textContent = AR.status === "loading" ? "AR loading" : AR.status === "error" ? "AR error" : `AR ${AR.ways.length} roads`;
+  const wait = AR.retryAt ? Math.max(0, Math.ceil((AR.retryAt - Date.now())/1000)) : 0;
+  a.textContent = AR.status === "loading" ? `AR loading…` :
+    AR.status === "error" ? `AR retry ${wait}s` :
+    AR.status === "stale" ? `AR ${AR.ways.length} roads · retry ${wait}s` : `AR ${AR.ways.length} roads`;
   a.className = "chip " + (AR.status === "error" ? "bad" : AR.status === "ok" ? "ok" : "warn");
   $("calShow").textContent = `az ${S.cal.az >= 0 ? "+" : ""}${S.cal.az.toFixed(1)}° · el ${S.cal.el >= 0 ? "+" : ""}${S.cal.el.toFixed(2)}°`;
 }
@@ -701,7 +739,7 @@ $("range").onchange = () => {
 };
 $("camOn").onchange = () => { if ($("camOn").checked){ if (S.sensorsOn) startCam(); } else stopCam(); };
 $("arOn").onchange = () => { updateChips(); if ($("arOn").checked){ if (!S.pos) toast("AR streets load once you have a location."); maybeReloadStreets(); } };
-$("arRad").onchange = () => { AR.origin = null; maybeReloadStreets(); };
+$("arRad").onchange = () => { AR.origin = null; AR.retryAt = 0; maybeReloadStreets(); };
 $("layer").onchange = () => { Object.values(layers).forEach(l => map.removeLayer(l)); layers[$("layer").value].addTo(map); };
 $("sim").onchange = () => { updateChips(); if ($("sim").checked) toast("Simulate on: tap the map to place yourself, then use the Az/El sliders."); };
 $("simAz").oninput = () => $("simAzV").textContent = (+$("simAz").value).toFixed(1) + "°";
@@ -723,7 +761,8 @@ function snapshot(){
       axes:S.axes && S.axes.map(a => a.map(r3)), backVec:S.vec && S.vec.map(r3) },
     position:{ pos:S.pos, acc:r3(S.acc), gpsAlt:r3(S.gpsAlt), demHere, observerH:r3(S.pos ? observerHeight() : null), hSrc:S.hSrc },
     dem:{ z:dem.z, tilesLoaded:dem.loaded, tilesRequested:dem.tiles.size },
-    ar:{ on:$("arOn").checked, status:AR.status, ways:AR.ways.length, origin:AR.origin, visOrigin:AR.visOrigin, visH0:r3(AR.visH0) },
+    ar:{ on:$("arOn").checked, status:AR.status, server:AR.server, fails:AR.fails, lastErr:AR.lastErr, serverErrs:AR.serverErrs,
+      retryInS:AR.retryAt ? Math.round((AR.retryAt - Date.now())/1000) : null, ways:AR.ways.length, origin:AR.origin, visOrigin:AR.visOrigin, visH0:r3(AR.visH0) },
     lastFix:f && { az:r3(f.az), el:r3(f.el), h0:r3(f.h0), obs:f.obs, missing:f.missing,
       hit:f.hit && { lat:r3(f.hit.lat*100)/100, lon:r3(f.hit.lon*100)/100, d:r3(f.hit.d), elev:r3(f.hit.elev) },
       sky:f.sky && { d:r3(f.sky.d), ang:r3(f.sky.ang), elev:r3(f.sky.elev) } },

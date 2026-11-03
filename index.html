@@ -37,9 +37,14 @@ header h1{font:600 17px var(--sans);letter-spacing:.06em;text-transform:uppercas
 .big{font-size:17px;font-weight:600}
 .lbl{color:var(--dim);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
 #locked{position:absolute;right:max(10px,env(safe-area-inset-right,0px));top:10px;font:600 12px var(--mono);color:var(--bg);background:var(--reticle);padding:3px 7px;border-radius:3px;letter-spacing:.1em}
-#map{flex:1 1 auto;min-height:120px;background:#1a2326}
-#banner{padding:8px max(12px,env(safe-area-inset-right,0px)) 8px max(12px,env(safe-area-inset-left,0px));background:#3a3216;color:var(--reticle);font-size:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#banner span{flex:1 1 200px}
+#map{flex:1 1 auto;min-height:120px;background:#1a2326;z-index:0}
+[hidden]{display:none!important}
+#mapWrap{position:relative;flex:1 1 auto;min-height:120px;display:flex}
+#banner{position:absolute;top:8px;left:max(8px,env(safe-area-inset-left,0px));right:max(8px,env(safe-area-inset-right,0px));z-index:900;
+  padding:6px 6px 6px 10px;background:rgba(58,50,22,.94);color:var(--reticle);font-size:13px;line-height:1.3;border-radius:4px;
+  display:flex;gap:6px;align-items:center;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+#banner span{flex:1 1 auto;min-width:0}
+#banner button{flex:none;padding:6px 10px;font-size:12px}
 nav{display:flex;gap:6px;padding:8px max(10px,env(safe-area-inset-right,0px)) 8px max(10px,env(safe-area-inset-left,0px));border-top:1px solid var(--line);background:var(--panel)}
 button{font:600 14px var(--sans);letter-spacing:.04em;text-transform:uppercase;color:var(--fg);background:#22302f;border:1px solid var(--line);border-radius:4px;padding:11px 8px;flex:1 1 0;min-width:0;cursor:pointer}
 button.primary{background:var(--reticle);color:#1a1606;border-color:var(--reticle)}
@@ -89,8 +94,10 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div id="roResult" class="ro"><span id="headline">Press Start, then aim the crosshair at the ground point.</span></div>
 </div>
 
-<div id="banner" hidden><span id="bannerText"></span><button id="bannerSet" class="primary" hidden>Set</button><button id="bannerCancel">Cancel</button></div>
-<div id="map"></div>
+<div id="mapWrap">
+  <div id="map" style="flex:1 1 auto"></div>
+  <div id="banner" hidden><span id="bannerText"></span><button id="bannerSet" class="primary" hidden>Set</button><button id="bannerCancel" aria-label="Dismiss">✕</button></div>
+</div>
 
 <nav>
   <button id="btnStart" class="primary">Start</button>
@@ -644,18 +651,26 @@ function updateChips(){
   $("calShow").textContent = `az ${S.cal.az >= 0 ? "+" : ""}${S.cal.az.toFixed(1)}° · el ${S.cal.el >= 0 ? "+" : ""}${S.cal.el.toFixed(2)}°`;
 }
 let toastT;
-function toast(msg){ banner(msg, false, true); clearTimeout(toastT); toastT = setTimeout(() => { if (!S.calMode) $("banner").hidden = true; }, 5000); }
-function banner(msg, showSet, isToast){
-  $("bannerText").textContent = msg; $("banner").hidden = false;
-  $("bannerSet").hidden = !showSet; $("bannerCancel").textContent = isToast ? "Dismiss" : "Cancel";
-  map.invalidateSize();
+const dismissed = new Set();               // repeating messages (e.g. GPS timeouts) stay quiet once dismissed
+function toast(msg){
+  if (S.calMode || dismissed.has(msg)) return;
+  banner(msg, false, true); clearTimeout(toastT);
+  toastT = setTimeout(() => { if (!S.calMode) $("banner").hidden = true; }, 5000);
 }
-$("bannerCancel").onclick = () => { S.calMode = 0; gCal.remove(); $("banner").hidden = true; map.invalidateSize(); };
+function banner(msg, showSet, isToast){
+  if (!isToast) clearTimeout(toastT);
+  $("bannerText").textContent = msg; $("banner").hidden = false;
+  $("bannerSet").hidden = !showSet; $("banner").dataset.toast = isToast ? "1" : "";
+}
+$("bannerCancel").onclick = () => {
+  if ($("banner").dataset.toast) dismissed.add($("bannerText").textContent);
+  clearTimeout(toastT); S.calMode = 0; gCal.remove(); $("banner").hidden = true;
+};
 $("bannerSet").onclick = () => {
   const m = measured();
-  if (!m || !S.pos || !S.calTarget){ toast("Need a location and a heading first."); return; }
+  if (!m || !S.pos || !S.calTarget){ banner("Need a location and a heading first. Aim at the landmark and press Set again.", true); return; }
   const h0 = observerHeight(), T = elevAt(S.calTarget[0], S.calTarget[1]);
-  if (h0 === null || T === null){ toast("Elevation still loading. Try Set again in a moment."); return; }
+  if (h0 === null || T === null){ banner("Elevation still loading. Press Set again in a moment.", true); return; }
   const [d, brg] = distBear(S.pos, S.calTarget), k = +$("refr").value || 0;
   const trueEl = Math.atan2(T - h0 - (1 - k)*d*d/(2*RE), d)*R2D;
   S.cal = { az:((brg - m.az + 540) % 360) - 180, el:trueEl - m.el };

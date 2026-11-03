@@ -254,12 +254,25 @@ function deviceAxes(a, b, g){
 }
 function onOrient(e, kind){
   if (e.beta == null) return;
-  let alpha;
-  if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading)){ alpha = 360 - e.webkitCompassHeading; kind = "iOS compass"; }
-  else if (kind === "absolute" || e.absolute) alpha = e.alpha;
+  let ax;
+  if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading) && e.alpha != null){
+    // iOS: alpha/beta/gamma come from the gyro in an arbitrary heading frame. Use them for all motion,
+    // and use the compass only as a slowly filtered offset from that frame to north. Substituting the
+    // compass into alpha double-counts yaw when the phone is upright (Euler degeneracy near beta = 90°).
+    kind = "iOS compass";
+    ax = deviceAxes(e.alpha, e.beta, e.gamma);
+    const back = ax[2].map(c => -c);
+    const ref = Math.abs(back[2]) < 0.8 ? back : ax[1];      // upright: camera direction; flat: top of phone
+    const azRaw = Math.atan2(ref[0], ref[1])*R2D;
+    const diff = ((e.webkitCompassHeading - azRaw + 540) % 360) - 180;
+    if (S.iosOff == null) S.iosOff = diff;
+    else S.iosOff += 0.03*(((diff - S.iosOff + 540) % 360) - 180);
+    const d = S.iosOff*D2R, c = Math.cos(d), s = Math.sin(d);
+    ax = ax.map(([x, y, z]) => [x*c + y*s, y*c - x*s, z]);
+  }
+  else if (kind === "absolute" || e.absolute) ax = deviceAxes(e.alpha, e.beta, e.gamma);
   else { S.kind = "relative only"; updateChips(); return; }
   S.kind = kind;
-  const ax = deviceAxes(alpha, e.beta, e.gamma);
   if (!S.axes) S.axes = ax;
   else for (let j = 0; j < 3; j++){
     for (let i = 0; i < 3; i++) S.axes[j][i] += 0.15*(ax[j][i] - S.axes[j][i]);

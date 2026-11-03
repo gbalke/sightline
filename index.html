@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sightline</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@400;600&display=swap">
+<style>
+/* Instrument layout: reticle viewport on top, map below, control strip at the thumb. Single dark theme for outdoor/camera use. */
+:root{
+  --bg:#0f1517; --panel:#172124; --line:#2a3a3e; --fg:#e4ece9; --dim:#8fa29e;
+  --reticle:#f2c94c; --ray:#4fd1c5; --hit:#ff6b5b; --ok:#7bd88f; --warn:#f2c94c;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  --sans:"IBM Plex Sans Condensed","Arial Narrow",system-ui,sans-serif;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.35 var(--sans);display:flex;flex-direction:column;
+  padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);overflow:hidden}
+header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:8px max(12px,env(safe-area-inset-right,0px)) 8px max(12px,env(safe-area-inset-left,0px));border-bottom:1px solid var(--line)}
+header h1{font:600 17px var(--sans);letter-spacing:.06em;text-transform:uppercase;margin:0 auto 0 0}
+.chip{font:12px var(--mono);padding:2px 7px;border:1px solid var(--line);border-radius:3px;color:var(--dim);white-space:nowrap}
+.chip.ok{color:var(--ok);border-color:#2f5a3a}.chip.warn{color:var(--warn);border-color:#5a4a20}.chip.bad{color:var(--hit);border-color:#5a2a26}
+#view{position:relative;flex:0 0 42%;background:
+  repeating-linear-gradient(0deg,transparent 0 39px,#1c282b 39px 40px),
+  repeating-linear-gradient(90deg,transparent 0 39px,#1c282b 39px 40px),var(--bg);overflow:hidden}
+#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#ar{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+#reticle{position:absolute;left:50%;top:50%;width:150px;height:150px;transform:translate(-50%,-50%);pointer-events:none}
+.ro{position:absolute;font:13px/1.4 var(--mono);background:rgba(15,21,23,.72);padding:6px 8px;border-radius:3px;font-variant-numeric:tabular-nums}
+#roAngles{left:max(10px,env(safe-area-inset-left,0px));top:10px}
+#roResult{left:max(10px,env(safe-area-inset-left,0px));right:max(10px,env(safe-area-inset-right,0px));bottom:10px;text-align:center}
+.big{font-size:17px;font-weight:600}
+.lbl{color:var(--dim);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+#locked{position:absolute;right:max(10px,env(safe-area-inset-right,0px));top:10px;font:600 12px var(--mono);color:var(--bg);background:var(--reticle);padding:3px 7px;border-radius:3px;letter-spacing:.1em}
+#map{flex:1 1 auto;min-height:120px;background:#1a2326}
+#banner{padding:8px max(12px,env(safe-area-inset-right,0px)) 8px max(12px,env(safe-area-inset-left,0px));background:#3a3216;color:var(--reticle);font-size:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#banner span{flex:1 1 200px}
+nav{display:flex;gap:6px;padding:8px max(10px,env(safe-area-inset-right,0px)) 8px max(10px,env(safe-area-inset-left,0px));border-top:1px solid var(--line);background:var(--panel)}
+button{font:600 14px var(--sans);letter-spacing:.04em;text-transform:uppercase;color:var(--fg);background:#22302f;border:1px solid var(--line);border-radius:4px;padding:11px 8px;flex:1 1 0;min-width:0;cursor:pointer}
+button.primary{background:var(--reticle);color:#1a1606;border-color:var(--reticle)}
+button.on{border-color:var(--reticle);color:var(--reticle)}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--ray);outline-offset:2px}
+#sheet{position:fixed;left:0;right:0;bottom:0;max-height:78%;overflow:auto;background:var(--panel);border-top:2px solid var(--reticle);
+  padding:14px max(16px,env(safe-area-inset-right,0px)) calc(16px + env(safe-area-inset-bottom,0px)) max(16px,env(safe-area-inset-left,0px));z-index:1000}
+#sheet h2{font:600 14px var(--sans);text-transform:uppercase;letter-spacing:.1em;margin:14px 0 6px;color:var(--dim)}
+#sheet h2:first-child{margin-top:0}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--line)}
+.row label{flex:1}
+.row input[type=number],.row select{width:110px;font:14px var(--mono);background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:6px}
+.row input[type=range]{flex:1}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+#result{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font:13px var(--mono)}
+#result a{color:var(--ray)}
+.note{color:var(--dim);font-size:13px;max-width:60ch}
+.leaflet-container{font-family:var(--sans)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Sightline</h1>
+  <span id="chipGps" class="chip">GPS —</span>
+  <span id="chipCmp" class="chip">Compass —</span>
+  <span id="chipDem" class="chip">DEM 0</span>
+  <span id="chipAr" class="chip" hidden>AR —</span>
+</header>
+
+<div id="view">
+  <video id="cam" playsinline muted hidden></video>
+  <canvas id="ar"></canvas>
+  <svg id="reticle" viewBox="-75 -75 150 150" aria-hidden="true">
+    <g stroke="var(--reticle)" stroke-width="1.5" fill="none">
+      <circle r="34"/><circle r="2" fill="var(--reticle)"/>
+      <path d="M-70 0H-40M40 0H70M0-70V-40M0 40V70"/>
+      <path d="M-34 -6v12M34 -6v12M-6 -34h12M-6 34h12" stroke-width="1"/>
+    </g>
+  </svg>
+  <div id="roAngles" class="ro">
+    <div><span class="lbl">Az</span> <span id="az" class="big">—</span></div>
+    <div><span class="lbl">El</span> <span id="el" class="big">—</span></div>
+  </div>
+  <div id="locked" hidden>LOCKED</div>
+  <div id="roResult" class="ro"><span id="headline">Press Start, then aim the crosshair at the ground point.</span></div>
+</div>
+
+<div id="banner" hidden><span id="bannerText"></span><button id="bannerSet" class="primary" hidden>Set</button><button id="bannerCancel">Cancel</button></div>
+<div id="map"></div>
+
+<nav>
+  <button id="btnStart" class="primary">Start</button>
+  <button id="btnLock">Lock</button>
+  <button id="btnCal">Calibrate</button>
+  <button id="btnMore">More</button>
+</nav>
+
+<div id="sheet" hidden>
+  <h2>Last fix</h2>
+  <div id="result" class="mono"><span class="lbl">—</span><span>No result yet</span></div>
+
+  <h2>Ray</h2>
+  <div class="row"><label for="range">Max range (km)</label><select id="range"><option>5</option><option>10</option><option selected>20</option><option>40</option></select></div>
+  <div class="row"><label for="eye">Eye height above ground (m)</label><input id="eye" type="number" step="0.1" value="1.6"></div>
+  <div class="row"><label for="useGpsAlt">Use GPS altitude instead of DEM</label><input id="useGpsAlt" type="checkbox"></div>
+  <div class="row"><label for="refr">Refraction coefficient k</label><input id="refr" type="number" step="0.01" value="0.13"></div>
+
+  <h2>Uncertainty box</h2>
+  <div class="row"><label for="uAz">Azimuth ± (°)</label><input id="uAz" type="number" step="0.5" value="2"></div>
+  <div class="row"><label for="uEl">Elevation ± (°)</label><input id="uEl" type="number" step="0.1" value="0.5"></div>
+
+  <h2>Heading corrections</h2>
+  <div class="row"><label for="decl">Magnetic declination (° east +)</label><input id="decl" type="number" step="0.1" value="0"></div>
+  <div class="row"><span>Landmark calibration offset</span><span id="calShow" class="mono">az +0.0° · el +0.0°</span></div>
+  <div class="row"><button id="btnCalReset">Clear calibration</button></div>
+  <p class="note">Phone compasses report magnetic north and are often off by a few degrees. Calibrating on a landmark you can identify on the map absorbs both, and replaces the declination value above.</p>
+
+  <h2>View</h2>
+  <div class="row"><label for="camOn">Camera behind reticle</label><input id="camOn" type="checkbox" checked></div>
+  <div class="row"><label for="arOn">AR street overlay</label><input id="arOn" type="checkbox"></div>
+  <div class="row"><label for="arRad">Street radius (m)</label><select id="arRad"><option>800</option><option selected>1500</option><option>3000</option></select></div>
+  <div class="row"><label for="fov">Camera FOV, long side (°)</label><input id="fov" type="number" step="1" value="66"></div>
+  <div class="row"><label for="arHidden">Show streets hidden by terrain (faint)</label><input id="arHidden" type="checkbox" checked></div>
+  <p class="note">If overlay streets look stretched or squeezed relative to the real ones, adjust FOV. If they are shifted sideways or up/down, calibrate on a landmark. Street data © OpenStreetMap contributors.</p>
+  <div class="row"><label for="layer">Map</label><select id="layer"><option value="topo">Topo</option><option value="sat">Satellite</option></select></div>
+
+  <h2>Simulate (no sensors)</h2>
+  <div class="row"><label for="sim">Simulate mode — tap map to place yourself</label><input id="sim" type="checkbox"></div>
+  <div class="row"><label for="simAz">Az</label><input id="simAz" type="range" min="0" max="359.9" step="0.1" value="0"><span id="simAzV" class="mono">0.0°</span></div>
+  <div class="row"><label for="simEl">El</label><input id="simEl" type="range" min="-30" max="15" step="0.05" value="-2"><span id="simElV" class="mono">-2.00°</span></div>
+  <div class="row"><button id="btnClose" class="primary">Close</button></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const D2R = Math.PI/180, R2D = 180/Math.PI, RE = 6371000;
+const norm360 = a => ((a % 360) + 360) % 360;
+
+/* ---------- geodesy ---------- */
+function dest(lat, lon, az, d){
+  const p1 = lat*D2R, l1 = lon*D2R, t = az*D2R, dr = d/RE;
+  const p2 = Math.asin(Math.sin(p1)*Math.cos(dr) + Math.cos(p1)*Math.sin(dr)*Math.cos(t));
+  const l2 = l1 + Math.atan2(Math.sin(t)*Math.sin(dr)*Math.cos(p1), Math.cos(dr) - Math.sin(p1)*Math.sin(p2));
+  return [p2*R2D, ((l2*R2D + 540) % 360) - 180];
+}
+function distBear(a, b){
+  const p1=a[0]*D2R, p2=b[0]*D2R, dl=(b[1]-a[1])*D2R;
+  const h = Math.sin((p2-p1)/2)**2 + Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+  const d = 2*RE*Math.asin(Math.sqrt(h));
+  const brg = norm360(Math.atan2(Math.sin(dl)*Math.cos(p2), Math.cos(p1)*Math.sin(p2) - Math.sin(p1)*Math.cos(p2)*Math.cos(dl))*R2D);
+  return [d, brg];
+}
+function tileXY(lat, lon, z){
+  const n = 2**z, r = lat*D2R;
+  return [(lon+180)/360*n, (1 - Math.log(Math.tan(r) + 1/Math.cos(r))/Math.PI)/2*n];
+}
+
+/* ---------- DEM: AWS Terrarium tiles ---------- */
+const dem = { z:12, tiles:new Map(), loaded:0 };
+function demZoomFor(rangeKm){ return rangeKm <= 10 ? 13 : 12; }
+function loadTile(z, x, y){
+  const n = 2**z; x = ((x % n) + n) % n;
+  const key = z+"/"+x+"/"+y;
+  if (dem.tiles.has(key)) return dem.tiles.get(key);
+  const entry = { data:null, p:null };
+  entry.p = new Promise(res => {
+    const img = new Image(); img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const c = document.createElement("canvas"); c.width = c.height = 256;
+      const g = c.getContext("2d", { willReadFrequently:true }); g.drawImage(img, 0, 0);
+      const px = g.getImageData(0, 0, 256, 256).data, out = new Float32Array(65536);
+      for (let i = 0; i < 65536; i++){
+        const e = px[i*4]*256 + px[i*4+1] + px[i*4+2]/256 - 32768;
+        out[i] = e < 0 ? 0 : e;            // sea and bathymetry clamp to the sea surface
+      }
+      entry.data = out; dem.loaded++; updateChips(); res(entry);
+    };
+    img.onerror = () => { entry.data = "err"; res(entry); };
+    img.src = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
+  });
+  dem.tiles.set(key, entry);
+  return entry;
+}
+/* bilinear elevation; returns null when the tile is not loaded yet */
+function elevAt(lat, lon){
+  const z = dem.z, [fx, fy] = tileXY(lat, lon, z);
+  const tx = Math.floor(fx), ty = Math.floor(fy);
+  const t = loadTile(z, tx, ty);
+  if (!t.data || t.data === "err") return null;
+  const u = Math.min(Math.max((fx - tx)*256 - 0.5, 0), 254.999), v = Math.min(Math.max((fy - ty)*256 - 0.5, 0), 254.999);
+  const i = Math.floor(u), j = Math.floor(v), du = u - i, dv = v - j, d = t.data;
+  const a = d[j*256+i], b = d[j*256+i+1], c = d[(j+1)*256+i], e = d[(j+1)*256+i+1];
+  return (a*(1-du) + b*du)*(1-dv) + (c*(1-du) + e*du)*dv;
+}
+function preload(lat, lon, rangeM){
+  const z = dem.z, [cx, cy] = tileXY(lat, lon, z);
+  const tileM = 2*Math.PI*RE*Math.cos(lat*D2R)/2**z, r = Math.ceil(rangeM/tileM) + 1;
+  const ps = [];
+  for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++)
+    if (dx*dx + dy*dy <= (r+1)*(r+1)) ps.push(loadTile(z, Math.floor(cx)+dx, Math.floor(cy)+dy).p);
+  return Promise.all(ps);
+}
+
+/* ---------- ray cast against terrain, with earth curvature and refraction ---------- */
+function castRay(obs, h0, az, el, maxR, k, elev){
+  const tanEl = Math.tan(el*D2R), curv = (1 - k)/(2*RE);
+  const rayH = d => h0 + d*tanEl + curv*d*d;
+  let prev = 0, d = 5, missing = false, sky = null;
+  while (d <= maxR){
+    const p = dest(obs[0], obs[1], az, d), T = elev(p[0], p[1]);
+    if (T === null){ missing = true; }
+    else {
+      const ang = Math.atan2(T - h0 - curv*d*d, d)*R2D;
+      if (!sky || ang > sky.ang) sky = { lat:p[0], lon:p[1], d, elev:T, ang };
+      if (rayH(d) <= T){
+        let lo = prev, hi = d;
+        for (let i = 0; i < 18; i++){
+          const m = (lo + hi)/2, q = dest(obs[0], obs[1], az, m), Tm = elev(q[0], q[1]);
+          if (Tm !== null && rayH(m) <= Tm) hi = m; else lo = m;
+        }
+        const q = dest(obs[0], obs[1], az, hi);
+        return { hit:{ lat:q[0], lon:q[1], d:hi, elev:elev(q[0], q[1]) }, sky, missing };
+      }
+    }
+    prev = d;
+    d += Math.min(Math.max(d*0.003, 8), 60);
+  }
+  return { hit:null, sky, missing };
+}
+
+/* ---------- state ---------- */
+const S = {
+  pos:null, acc:null, gpsAlt:null, sensorsOn:false, kind:"none",
+  vec:null, locked:false, cal:{ az:0, el:0 }, calTarget:null, calMode:0, lastFix:null,
+};
+try { const c = JSON.parse(localStorage.getItem("sightline.cal")); if (c) S.cal = c; } catch(e){}
+try { const v = localStorage.getItem("sightline.decl"); if (v !== null) $("decl").value = v; } catch(e){}
+
+/* device axes X (right), Y (top), Z (out of screen) in East-North-Up, from W3C R = Rz(alpha)·Rx(beta)·Ry(gamma).
+   The back camera looks along -Z. */
+function deviceAxes(a, b, g){
+  a*=D2R; b*=D2R; g*=D2R;
+  const ca=Math.cos(a), sa=Math.sin(a), cb=Math.cos(b), sb=Math.sin(b), cg=Math.cos(g), sg=Math.sin(g);
+  return [
+    [ca*cg - sa*sb*sg, sa*cg + ca*sb*sg, -cb*sg],
+    [-sa*cb,           ca*cb,            sb],
+    [ca*sg + sa*sb*cg, sa*sg - ca*sb*cg, cb*cg],
+  ];
+}
+function onOrient(e, kind){
+  if (e.beta == null) return;
+  let alpha;
+  if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading)){ alpha = 360 - e.webkitCompassHeading; kind = "iOS compass"; }
+  else if (kind === "absolute" || e.absolute) alpha = e.alpha;
+  else { S.kind = "relative only"; updateChips(); return; }
+  S.kind = kind;
+  const ax = deviceAxes(alpha, e.beta, e.gamma);
+  if (!S.axes) S.axes = ax;
+  else for (let j = 0; j < 3; j++){
+    for (let i = 0; i < 3; i++) S.axes[j][i] += 0.15*(ax[j][i] - S.axes[j][i]);
+    const n = Math.hypot(...S.axes[j]); for (let i = 0; i < 3; i++) S.axes[j][i] /= n;
+  }
+  S.vec = S.axes[2].map(c => -c);
+}
+function measured(){
+  if ($("sim").checked) return { az:+$("simAz").value, el:+$("simEl").value };
+  if (!S.vec) return null;
+  const [x, y, z] = S.vec, h = Math.hypot(x, y);
+  return { az:norm360(Math.atan2(x, y)*R2D + (+$("decl").value || 0)), el:Math.atan2(z, h)*R2D };
+}
+function corrected(){
+  const m = measured(); if (!m) return null;
+  return { az:norm360(m.az + S.cal.az), el:m.el + S.cal.el, raw:m };
+}
+
+/* ---------- sensors ---------- */
+async function start(){
+  $("btnStart").textContent = "Running"; $("btnStart").classList.remove("primary");
+  try {
+    if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function"){
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r !== "granted") toast("Motion access was denied. Allow it in Safari settings for this site, or use Simulate.");
+    }
+  } catch(e){ toast("Motion permission failed: " + e.message); }
+  if ("ondeviceorientationabsolute" in window) addEventListener("deviceorientationabsolute", e => onOrient(e, "absolute"));
+  else addEventListener("deviceorientation", e => onOrient(e, "device"));
+  if ("geolocation" in navigator){
+    navigator.geolocation.watchPosition(p => {
+      if ($("sim").checked) return;
+      setObserver([p.coords.latitude, p.coords.longitude]);
+      S.acc = p.coords.accuracy; S.gpsAlt = p.coords.altitude; updateChips();
+    }, err => { toast("Location: " + err.message); updateChips(); }, { enableHighAccuracy:true, maximumAge:2000, timeout:20000 });
+  }
+  if ($("camOn").checked) startCam();
+  S.sensorsOn = true;
+}
+let camStream = null;
+async function startCam(){
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:"environment" } }, audio:false });
+    $("cam").srcObject = camStream; $("cam").hidden = false; await $("cam").play();
+  } catch(e){ $("cam").hidden = true; toast("Camera unavailable: " + e.message); }
+}
+function stopCam(){ if (camStream){ camStream.getTracks().forEach(t => t.stop()); camStream = null; } $("cam").hidden = true; }
+
+/* ---------- map ---------- */
+const map = L.map("map", { zoomControl:false, attributionControl:true }).setView([-41.29, 174.78], 11);
+const layers = {
+  topo: L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", { maxZoom:17, attribution:"© OpenStreetMap, SRTM · OpenTopoMap (CC-BY-SA)" }),
+  sat: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { maxZoom:19, attribution:"Imagery © Esri" }),
+};
+layers.topo.addTo(map);
+const gObs = L.circleMarker([0,0], { radius:7, color:"#0f1517", weight:2, fillColor:"#f2c94c", fillOpacity:1 });
+const gAcc = L.circle([0,0], { radius:1, color:"#f2c94c", weight:1, fillOpacity:.08 });
+const gRay = L.polyline([], { color:"#4fd1c5", weight:2, dashArray:"6 5" });
+const gBox = L.polygon([], { color:"#ff6b5b", weight:1, fillOpacity:.15 });
+const gHit = L.circleMarker([0,0], { radius:8, color:"#fff", weight:2, fillColor:"#ff6b5b", fillOpacity:1 });
+const gSky = L.circleMarker([0,0], { radius:5, color:"#4fd1c5", weight:2, fillOpacity:0 });
+const gCal = L.marker([0,0]);
+let followed = false;
+
+function setObserver(ll){
+  const first = !S.pos;
+  const moved = S.pos ? distBear(S.pos, ll)[0] : Infinity;
+  S.pos = ll;
+  gObs.setLatLng(ll).addTo(map);
+  gAcc.setLatLng(ll).setRadius(S.acc || 1).addTo(map);
+  if (first || moved > 1000){ preload(ll[0], ll[1], rangeM()); }
+  if (!followed){ map.setView(ll, 13); followed = true; }
+}
+map.on("click", e => {
+  const ll = [e.latlng.lat, e.latlng.lng];
+  if (S.calMode === 1){
+    S.calTarget = ll; gCal.setLatLng(ll).addTo(map); S.calMode = 2;
+    loadTile(dem.z, ...tileXY(ll[0], ll[1], dem.z).map(Math.floor));
+    banner("Aim the crosshair at that landmark, hold steady, then press Set.", true);
+    return;
+  }
+  if ($("sim").checked){ S.acc = 5; setObserver(ll); }
+});
+const rangeM = () => (+$("range").value)*1000;
+
+/* ---------- main loop ---------- */
+function observerHeight(){
+  if ($("useGpsAlt").checked && S.gpsAlt != null) return S.gpsAlt;
+  const g = elevAt(S.pos[0], S.pos[1]);
+  return g === null ? null : g + (+$("eye").value || 0);
+}
+function fmtKm(d){ return d < 1000 ? d.toFixed(0) + " m" : (d/1000).toFixed(d < 10000 ? 2 : 1) + " km"; }
+
+function tick(){
+  const c = corrected();
+  if (c){ $("az").textContent = c.az.toFixed(1) + "°"; $("el").textContent = (c.el >= 0 ? "+" : "") + c.el.toFixed(2) + "°"; }
+  if (S.locked || !c || !S.pos){ updateChips(); return; }
+  const h0 = observerHeight();
+  if (h0 === null){ $("headline").textContent = "Loading elevation data…"; return; }
+  const k = +$("refr").value || 0, R = rangeM();
+  const res = castRay(S.pos, h0, c.az, c.el, R, k, elevAt);
+  const end = res.hit ? [res.hit.lat, res.hit.lon] : dest(S.pos[0], S.pos[1], c.az, R);
+  gRay.setLatLngs([S.pos, end]).addTo(map);
+
+  // uncertainty box from the four corner rays
+  const ua = +$("uAz").value || 0, ue = +$("uEl").value || 0, corners = [];
+  for (const [sa, se] of [[-1,-1],[1,-1],[1,1],[-1,1]]){
+    const r = castRay(S.pos, h0, c.az + sa*ua, c.el + se*ue, R, k, elevAt);
+    corners.push(r.hit ? [r.hit.lat, r.hit.lon] : dest(S.pos[0], S.pos[1], c.az + sa*ua, R));
+  }
+  gBox.setLatLngs([corners[0], corners[1], corners[2], corners[3]]).addTo(map);
+
+  if (res.hit){
+    gHit.setLatLng([res.hit.lat, res.hit.lon]).addTo(map); gSky.remove();
+    $("headline").innerHTML = `<span class="big">${fmtKm(res.hit.d)}</span> · ground ${res.hit.elev.toFixed(0)} m` + (res.missing ? " · <span style='color:var(--warn)'>DEM gaps</span>" : "");
+  } else {
+    gHit.remove();
+    if (res.sky){ gSky.setLatLng([res.sky.lat, res.sky.lon]).addTo(map); }
+    $("headline").innerHTML = `No ground hit within ${fmtKm(R)}` + (res.sky ? ` · skyline ${fmtKm(res.sky.d)} at ${res.sky.ang.toFixed(2)}°` : "") + (res.missing ? " · DEM still loading" : "");
+  }
+  S.lastFix = { ...res, az:c.az, el:c.el, h0, obs:S.pos.slice() };
+  updateChips();
+}
+setInterval(tick, 200);
+
+function showResult(){
+  const f = S.lastFix, el = $("result");
+  if (!f){ el.innerHTML = `<span class="lbl">—</span><span>No result yet</span>`; return; }
+  const rows = [["Az / El", `${f.az.toFixed(1)}° / ${f.el.toFixed(2)}°`], ["Observer h", `${f.h0.toFixed(0)} m`]];
+  if (f.hit){
+    const ll = `${f.hit.lat.toFixed(5)}, ${f.hit.lon.toFixed(5)}`;
+    rows.push(["Hit", `<span id="hitLL">${ll}</span> <button id="copyLL" style="flex:none;padding:3px 6px;font-size:11px">Copy</button>`],
+      ["Distance", fmtKm(f.hit.d)], ["Ground", `${f.hit.elev.toFixed(0)} m`],
+      ["Open", `<a href="https://www.google.com/maps/search/?api=1&query=${f.hit.lat},${f.hit.lon}" target="_blank" rel="noopener">Google Maps</a>`]);
+  } else rows.push(["Hit", "none in range"]);
+  el.innerHTML = rows.map(([a, b]) => `<span class="lbl">${a}</span><span>${b}</span>`).join("");
+  const cb = $("copyLL");
+  if (cb) cb.onclick = () => navigator.clipboard.writeText($("hitLL").textContent).then(() => cb.textContent = "Copied", () => {
+    const r = document.createRange(); r.selectNodeContents($("hitLL")); getSelection().removeAllRanges(); getSelection().addRange(r);
+  });
+}
+
+/* ---------- AR street overlay ---------- */
+const AR = { ways:[], origin:null, loading:false, visQueue:0, status:"" };
+const ROAD_STYLE = {
+  major:{ w:4, c:"#f2c94c" }, mid:{ w:3, c:"#ffd98a" }, minor:{ w:2, c:"#4fd1c5" }, path:{ w:1.5, c:"#b7f0e9", dash:[5,5] },
+};
+function roadClass(h){
+  if (/^(motorway|trunk|primary)/.test(h)) return "major";
+  if (/^(secondary|tertiary)/.test(h)) return "mid";
+  if (/^(path|footway|cycleway|track|steps|bridleway)$/.test(h)) return "path";
+  return "minor";
+}
+async function loadStreets(){
+  if (!S.pos || AR.loading) return;
+  AR.loading = true; AR.status = "loading"; updateChips();
+  const r = +$("arRad").value, [lat, lon] = S.pos;
+  const q = `[out:json][timeout:25];way(around:${r},${lat},${lon})[highway~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|track|path|footway|cycleway|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"];out geom;`;
+  try {
+    const res = await fetch("https://overpass-api.de/api/interpreter", { method:"POST", body:"data=" + encodeURIComponent(q),
+      headers:{ "Content-Type":"application/x-www-form-urlencoded" } });
+    if (!res.ok) throw new Error("Overpass returned " + res.status);
+    const js = await res.json();
+    await preload(lat, lon, r + 500);
+    AR.origin = [lat, lon];
+    AR.ways = js.elements.filter(w => w.geometry && w.geometry.length > 1).map(w => {
+      const pts = [];
+      for (let i = 0; i < w.geometry.length - 1; i++){        // densify to ~25 m so roads drape over terrain
+        const a = w.geometry[i], b = w.geometry[i+1];
+        const [d] = distBear([a.lat, a.lon], [b.lat, b.lon]), n = Math.max(1, Math.ceil(d/25));
+        for (let s = 0; s < n; s++) pts.push({ lat:a.lat + (b.lat - a.lat)*s/n, lon:a.lon + (b.lon - a.lon)*s/n });
+      }
+      const l = w.geometry[w.geometry.length - 1]; pts.push({ lat:l.lat, lon:l.lon });
+      return { name:(w.tags && w.tags.name) || "", cls:roadClass(w.tags.highway), pts };
+    });
+    computeVisibility();
+    AR.status = "ok";
+  } catch(e){ AR.status = "error"; toast("Street data failed: " + e.message); }
+  AR.loading = false; updateChips();
+}
+/* world position (ENU metres relative to the observer, curvature folded into Up) and terrain visibility per vertex.
+   Visibility depends only on observer and point, so it is computed once per location, in batches. */
+function computeVisibility(){
+  const h0 = observerHeight(); if (h0 === null){ setTimeout(computeVisibility, 500); return; }
+  const k = +$("refr").value || 0, curv = (1 - k)/(2*RE), obs = S.pos.slice(), cosL = Math.cos(obs[0]*D2R);
+  AR.visOrigin = obs;
+  const all = []; AR.ways.forEach(w => w.pts.forEach(p => all.push(p)));
+  const job = ++AR.visQueue; let i = 0;
+  (function batch(){
+    if (job !== AR.visQueue) return;
+    const end = Math.min(i + 400, all.length);
+    for (; i < end; i++){
+      const p = all[i], T = elevAt(p.lat, p.lon);
+      const e = (p.lon - obs[1])*D2R*RE*cosL, n = (p.lat - obs[0])*D2R*RE, d = Math.hypot(e, n);
+      const g = (T === null ? h0 - (+$("eye").value || 0) : T) + 0.5;   // half a metre above the road surface
+      p.w = [e, n, g - h0 - curv*d*d];
+      if (d < 30) { p.vis = true; continue; }
+      const ang = Math.atan2(g - h0 - curv*d*d, d)*R2D, brg = norm360(Math.atan2(e, n)*R2D);
+      const r = castRay(obs, h0, brg, ang, d - 25, k, elevAt);
+      p.vis = !r.hit;
+    }
+    if (i < all.length) setTimeout(batch, 0);
+  })();
+}
+function viewAxes(){
+  if ($("sim").checked){
+    const az = +$("simAz").value*D2R, el = +$("simEl").value*D2R;
+    const back = [Math.sin(az)*Math.cos(el), Math.cos(az)*Math.cos(el), Math.sin(el)];
+    const X = [Math.cos(az), -Math.sin(az), 0], Z = back.map(c => -c);
+    const Y = [Z[1]*X[2] - Z[2]*X[1], Z[2]*X[0] - Z[0]*X[2], Z[0]*X[1] - Z[1]*X[0]];
+    return { X, Y, Z, rot:S.cal.az };
+  }
+  if (!S.axes) return null;
+  return { X:S.axes[0], Y:S.axes[1], Z:S.axes[2], rot:(+$("decl").value || 0) + S.cal.az };
+}
+const arCv = $("ar"), arCx = arCv.getContext("2d");
+function drawAR(){
+  requestAnimationFrame(drawAR);
+  const W = arCv.clientWidth, H = arCv.clientHeight, dpr = devicePixelRatio || 1;
+  if (arCv.width !== Math.round(W*dpr) || arCv.height !== Math.round(H*dpr)){ arCv.width = Math.round(W*dpr); arCv.height = Math.round(H*dpr); }
+  arCx.setTransform(dpr, 0, 0, dpr, 0, 0); arCx.clearRect(0, 0, W, H);
+  if (!$("arOn").checked || !AR.ways.length) return;
+  const A = viewAxes(); if (!A) return;
+  // focal length in CSS px: FOV spans the long side of the displayed (cover-scaled) camera frame
+  const v = $("cam"); let L = Math.max(W, H);
+  if (!v.hidden && v.videoWidth){ const s = Math.max(W/v.videoWidth, H/v.videoHeight); L = Math.max(v.videoWidth, v.videoHeight)*s; }
+  const f = (L/2)/Math.tan((+$("fov").value || 66)*D2R/2);
+  const c = -A.rot*D2R, cc = Math.cos(c), sc = Math.sin(c);
+  const th = ((screen.orientation && screen.orientation.angle) || window.orientation || 0)*D2R, ct = Math.cos(th), st = Math.sin(th);
+  const elShift = f*Math.tan(S.cal.el*D2R);
+  const toCam = w => {
+    const e = w[0]*cc + w[1]*sc, n = w[1]*cc - w[0]*sc, u = w[2];
+    return [e*A.X[0] + n*A.X[1] + u*A.X[2], e*A.Y[0] + n*A.Y[1] + u*A.Y[2], -(e*A.Z[0] + n*A.Z[1] + u*A.Z[2])];
+  };
+  const toScr = p => {
+    const x = p[0]/p[2], y = p[1]/p[2];
+    return [W/2 + f*(x*ct + y*st), H/2 - f*(-x*st + y*ct) + elShift];
+  };
+  const showHidden = $("arHidden").checked, labels = new Map();
+  arCx.lineCap = "round"; arCx.lineJoin = "round";
+  for (const pass of [0, 1]){                 // hidden streets first, visible on top
+    for (const w of AR.ways){
+      const st_ = ROAD_STYLE[w.cls];
+      arCx.lineWidth = pass ? st_.w : Math.max(1, st_.w*0.6);
+      arCx.strokeStyle = st_.c; arCx.globalAlpha = pass ? 0.95 : 0.28;
+      arCx.setLineDash(pass ? (st_.dash || []) : [3,6]);
+      if (!pass && !showHidden) continue;
+      arCx.beginPath(); let pen = false;
+      for (let i = 0; i < w.pts.length - 1; i++){
+        const a = w.pts[i], b = w.pts[i+1];
+        if (!a.w || !b.w || a.vis === undefined) { pen = false; continue; }
+        if ((a.vis && b.vis) !== !!pass){ pen = false; continue; }
+        let pa = toCam(a.w), pb = toCam(b.w);
+        const near = 2;
+        if (pa[2] < near && pb[2] < near){ pen = false; continue; }
+        if (pa[2] < near){ const t = (near - pa[2])/(pb[2] - pa[2]); pa = pa.map((x, k) => x + t*(pb[k] - x)); pen = false; }
+        if (pb[2] < near){ const t = (near - pb[2])/(pa[2] - pb[2]); pb = pb.map((x, k) => x + t*(pa[k] - x)); }
+        const sa = toScr(pa), sb = toScr(pb);
+        if (!pen){ arCx.moveTo(sa[0], sa[1]); pen = true; }
+        arCx.lineTo(sb[0], sb[1]);
+        if (pb[2] < near + 1e-6) pen = false;
+        if (pass && w.name && sa[0] > 20 && sa[0] < W - 20 && sa[1] > 40 && sa[1] < H - 40){
+          const dc = Math.hypot(sa[0] - W/2, sa[1] - H/2), prev = labels.get(w.name);
+          if (!prev || dc < prev.dc) labels.set(w.name, { x:sa[0], y:sa[1], dc, d:pa[2] });
+        }
+      }
+      arCx.stroke();
+    }
+  }
+  arCx.globalAlpha = 1; arCx.setLineDash([]);
+  arCx.font = "600 12px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+  [...labels.entries()].sort((a, b) => a[1].dc - b[1].dc).slice(0, 10).forEach(([name, p]) => {
+    const t = `${name} · ${fmtKm(p.d)}`, tw = arCx.measureText(t).width;
+    arCx.fillStyle = "rgba(15,21,23,.78)"; arCx.fillRect(p.x - tw/2 - 4, p.y - 18, tw + 8, 16);
+    arCx.fillStyle = "#e4ece9"; arCx.fillText(t, p.x - tw/2, p.y - 6);
+  });
+}
+requestAnimationFrame(drawAR);
+function maybeReloadStreets(){
+  if (!$("arOn").checked || !S.pos) return;
+  if (!AR.origin || distBear(AR.origin, S.pos)[0] > +$("arRad").value*0.25) loadStreets();
+  else if (!AR.loading && AR.visOrigin && distBear(AR.visOrigin, S.pos)[0] > 30) computeVisibility();
+}
+setInterval(maybeReloadStreets, 3000);
+
+/* ---------- UI ---------- */
+function updateChips(){
+  const g = $("chipGps");
+  if ($("sim").checked){ g.textContent = "SIM"; g.className = "chip warn"; }
+  else if (S.pos){ g.textContent = `GPS ±${Math.round(S.acc || 0)} m`; g.className = "chip " + (S.acc < 15 ? "ok" : "warn"); }
+  const c = $("chipCmp");
+  if ($("sim").checked){ c.textContent = "Compass SIM"; c.className = "chip warn"; }
+  else if (S.vec){ c.textContent = S.kind; c.className = "chip " + (S.kind === "relative only" ? "bad" : "ok"); }
+  else if (S.kind === "relative only"){ c.textContent = "No north ref"; c.className = "chip bad"; }
+  $("chipDem").textContent = `DEM z${dem.z} · ${dem.loaded}`;
+  const a = $("chipAr"); a.hidden = !$("arOn").checked;
+  a.textContent = AR.status === "loading" ? "AR loading" : AR.status === "error" ? "AR error" : `AR ${AR.ways.length} roads`;
+  a.className = "chip " + (AR.status === "error" ? "bad" : AR.status === "ok" ? "ok" : "warn");
+  $("calShow").textContent = `az ${S.cal.az >= 0 ? "+" : ""}${S.cal.az.toFixed(1)}° · el ${S.cal.el >= 0 ? "+" : ""}${S.cal.el.toFixed(2)}°`;
+}
+let toastT;
+function toast(msg){ banner(msg, false, true); clearTimeout(toastT); toastT = setTimeout(() => { if (!S.calMode) $("banner").hidden = true; }, 5000); }
+function banner(msg, showSet, isToast){
+  $("bannerText").textContent = msg; $("banner").hidden = false;
+  $("bannerSet").hidden = !showSet; $("bannerCancel").textContent = isToast ? "Dismiss" : "Cancel";
+  map.invalidateSize();
+}
+$("bannerCancel").onclick = () => { S.calMode = 0; gCal.remove(); $("banner").hidden = true; map.invalidateSize(); };
+$("bannerSet").onclick = () => {
+  const m = measured();
+  if (!m || !S.pos || !S.calTarget){ toast("Need a location and a heading first."); return; }
+  const h0 = observerHeight(), T = elevAt(S.calTarget[0], S.calTarget[1]);
+  if (h0 === null || T === null){ toast("Elevation still loading. Try Set again in a moment."); return; }
+  const [d, brg] = distBear(S.pos, S.calTarget), k = +$("refr").value || 0;
+  const trueEl = Math.atan2(T - h0 - (1 - k)*d*d/(2*RE), d)*R2D;
+  S.cal = { az:((brg - m.az + 540) % 360) - 180, el:trueEl - m.el };
+  try { localStorage.setItem("sightline.cal", JSON.stringify(S.cal)); } catch(e){}
+  S.calMode = 0; gCal.remove();
+  toast(`Calibrated: az ${S.cal.az.toFixed(1)}°, el ${S.cal.el.toFixed(2)}° (landmark ${fmtKm(d)} away).`);
+  updateChips();
+};
+$("btnStart").onclick = () => { if (!S.sensorsOn) start(); };
+$("btnLock").onclick = () => {
+  S.locked = !S.locked; $("btnLock").classList.toggle("on", S.locked);
+  $("btnLock").textContent = S.locked ? "Unlock" : "Lock"; $("locked").hidden = !S.locked;
+  if (S.locked && S.lastFix && S.lastFix.hit) map.fitBounds(L.latLngBounds([S.lastFix.obs, [S.lastFix.hit.lat, S.lastFix.hit.lon]]).pad(0.3));
+};
+$("btnCal").onclick = () => {
+  if (!S.pos){ toast("Get a location first (Start, or Simulate and tap the map)."); return; }
+  S.calMode = 1; banner("Tap a landmark you can see and identify on the map.", false);
+};
+$("btnMore").onclick = () => { showResult(); $("sheet").hidden = false; };
+$("btnClose").onclick = () => { $("sheet").hidden = true; };
+$("btnCalReset").onclick = () => { S.cal = { az:0, el:0 }; try { localStorage.removeItem("sightline.cal"); } catch(e){} updateChips(); };
+$("decl").onchange = () => { try { localStorage.setItem("sightline.decl", $("decl").value); } catch(e){} };
+$("range").onchange = () => {
+  const z = demZoomFor(+$("range").value);
+  if (z !== dem.z){ dem.z = z; dem.loaded = 0; dem.tiles.clear(); }
+  if (S.pos) preload(S.pos[0], S.pos[1], rangeM());
+};
+$("camOn").onchange = () => { if ($("camOn").checked){ if (S.sensorsOn) startCam(); } else stopCam(); };
+$("arOn").onchange = () => { updateChips(); if ($("arOn").checked){ if (!S.pos) toast("AR streets load once you have a location."); maybeReloadStreets(); } };
+$("arRad").onchange = () => { AR.origin = null; maybeReloadStreets(); };
+$("layer").onchange = () => { Object.values(layers).forEach(l => map.removeLayer(l)); layers[$("layer").value].addTo(map); };
+$("sim").onchange = () => { updateChips(); if ($("sim").checked) toast("Simulate on: tap the map to place yourself, then use the Az/El sliders."); };
+$("simAz").oninput = () => $("simAzV").textContent = (+$("simAz").value).toFixed(1) + "°";
+$("simEl").oninput = () => $("simElV").textContent = (+$("simEl").value).toFixed(2) + "°";
+dem.z = demZoomFor(+$("range").value);
+updateChips();
+if (!window.isSecureContext) toast("This page needs HTTPS for GPS, compass and camera.");
+</script>
+</body>
+</html>

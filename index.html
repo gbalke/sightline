@@ -727,7 +727,7 @@ function snapshot(){
     lastFix:f && { az:r3(f.az), el:r3(f.el), h0:r3(f.h0), obs:f.obs, missing:f.missing,
       hit:f.hit && { lat:r3(f.hit.lat*100)/100, lon:r3(f.hit.lon*100)/100, d:r3(f.hit.d), elev:r3(f.hit.elev) },
       sky:f.sky && { d:r3(f.sky.d), ang:r3(f.sky.ang), elev:r3(f.sky.elev) } },
-    locked:S.locked, settings, counts:DBG.counts,
+    locked:S.locked, settings, storage:{ ...STORE, savedNow:saved, origin:location.origin, path:location.pathname }, counts:DBG.counts,
     raw:{ orientation:DBG.orient, orientationAbsolute:DBG.abs, gps:DBG.gps }, errors:DBG.errors,
   };
 }
@@ -744,15 +744,32 @@ $("btnDbgCopy").onclick = () => {
 /* persist settings in this browser */
 const SAVED = ["range","eye","useGpsAlt","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","layer"];
 let saved = {};
-try { saved = JSON.parse(localStorage.getItem("sightline.settings")) || {}; } catch(e){}
+const STORE = { raw:null, readErr:null, writeErr:null, writes:0, restored:[], mismatched:[] };
+try { STORE.raw = localStorage.getItem("sightline.settings"); saved = JSON.parse(STORE.raw) || {}; } catch(e){ STORE.readErr = String(e); }
 SAVED.forEach(id => {
   const el = $(id);
-  if (id in saved){ if (el.type === "checkbox") el.checked = !!saved[id]; else el.value = saved[id]; }
-  el.addEventListener("change", () => {
+  el.setAttribute("autocomplete", "off");
+  if (id in saved){
+    if (el.type === "checkbox") el.checked = !!saved[id]; else el.value = saved[id];
+    const now = el.type === "checkbox" ? el.checked : el.value;
+    (String(now) === String(saved[id]) ? STORE.restored : STORE.mismatched).push(id);
+  }
+  const save = () => {
     saved[id] = el.type === "checkbox" ? el.checked : el.value;
-    try { localStorage.setItem("sightline.settings", JSON.stringify(saved)); } catch(e){}
-  });
+    try { localStorage.setItem("sightline.settings", JSON.stringify(saved)); STORE.writes++; } catch(e){ STORE.writeErr = String(e); }
+  };
+  el.addEventListener("input", save);         // input fires on every edit; change alone can be skipped if the page reloads mid-edit
+  el.addEventListener("change", save);
 });
+// re-apply after Chrome's own form-state restore, which can run after scripts on reload / back navigation
+addEventListener("pageshow", () => SAVED.forEach(id => {
+  if (!(id in saved)) return;
+  const el = $(id), want = saved[id];
+  if (el.type === "checkbox" ? el.checked !== !!want : el.value !== String(want)){
+    if (el.type === "checkbox") el.checked = !!want; else el.value = want;
+    el.dispatchEvent(new Event("change"));
+  }
+}));
 if ($("layer").value !== "topo"){ map.removeLayer(layers.topo); layers[$("layer").value].addTo(map); }
 dem.z = demZoomFor(+$("range").value);
 updateChips();

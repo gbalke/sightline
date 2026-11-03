@@ -133,6 +133,10 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div class="row"><label for="sim">Simulate mode — tap map to place yourself</label><input id="sim" type="checkbox"></div>
   <div class="row"><label for="simAz">Az</label><input id="simAz" type="range" min="0" max="359.9" step="0.1" value="0"><span id="simAzV" class="mono">0.0°</span></div>
   <div class="row"><label for="simEl">El</label><input id="simEl" type="range" min="-30" max="15" step="0.05" value="-2"><span id="simElV" class="mono">-2.00°</span></div>
+  <h2>Debug</h2>
+  <p class="note">Captures the last 20 raw readings from each sensor stream plus GPS, heading state, settings and the last fix. Copy it and paste it into a chat.</p>
+  <div class="row"><button id="btnDbgCopy" class="primary">Copy snapshot</button><button id="btnDbgShow">Show</button></div>
+  <textarea id="dbgOut" readonly hidden spellcheck="false" style="width:100%;height:220px;font:11px/1.35 var(--mono);background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:6px;margin-top:6px"></textarea>
   <div class="row"><button id="btnClose" class="primary">Close</button></div>
 </div>
 
@@ -277,12 +281,26 @@ function fuse(rawAx, compassAz){
   }
   return S.northOff == null ? null : rotYaw(rawAx, S.northOff);
 }
+/* ---------- debug ring buffers ---------- */
+const DBG = { orient:[], abs:[], gps:[], errors:[], counts:{ orient:0, abs:0, gps:0 } };
+const r3 = v => (typeof v === "number" && isFinite(v)) ? Math.round(v*1000)/1000 : v;
+function dbgPush(buf, rec){ buf.push(rec); if (buf.length > 20) buf.shift(); }
+function dbgOrient(name, e){
+  DBG.counts[name]++;
+  dbgPush(DBG[name], { t:Math.round(performance.now()), a:r3(e.alpha), b:r3(e.beta), g:r3(e.gamma), abs:e.absolute,
+    ...(e.webkitCompassHeading !== undefined ? { ch:r3(e.webkitCompassHeading), cacc:r3(e.webkitCompassAccuracy) } : {}) });
+}
+addEventListener("error", e => dbgPush(DBG.errors, { t:Math.round(performance.now()), msg:String(e.message), at:`${e.lineno}:${e.colno}` }));
+addEventListener("unhandledrejection", e => dbgPush(DBG.errors, { t:Math.round(performance.now()), msg:"rejection: " + String(e.reason && e.reason.message || e.reason) }));
+
 function onAbsolute(e){                       // Android: compass-referenced orientation, used only for north
+  dbgOrient("abs", e);
   if (e.alpha == null || e.beta == null) return;
   S.absAz = refAz(deviceAxes(e.alpha, e.beta, e.gamma)); S.absAt = performance.now();
   if (!S.relSeen) applyAxes(deviceAxes(e.alpha, e.beta, e.gamma), "compass only");   // fallback: no gyro stream
 }
 function onOrient(e){
+  dbgOrient("orient", e);
   if (e.beta == null || e.alpha == null) return;
   let ax, kind;
   if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading)){
@@ -332,6 +350,9 @@ async function start(){
   addEventListener("deviceorientation", onOrient);
   if ("geolocation" in navigator){
     navigator.geolocation.watchPosition(p => {
+      const k = p.coords; DBG.counts.gps++;
+      dbgPush(DBG.gps, { t:Math.round(performance.now()), ts:p.timestamp, lat:k.latitude, lon:k.longitude, acc:r3(k.accuracy),
+        alt:r3(k.altitude), altAcc:r3(k.altitudeAccuracy), hdg:r3(k.heading), spd:r3(k.speed) });
       if ($("sim").checked) return;
       setObserver([p.coords.latitude, p.coords.longitude]);
       S.acc = p.coords.accuracy; S.gpsAlt = p.coords.altitude; updateChips();
@@ -670,6 +691,41 @@ $("layer").onchange = () => { Object.values(layers).forEach(l => map.removeLayer
 $("sim").onchange = () => { updateChips(); if ($("sim").checked) toast("Simulate on: tap the map to place yourself, then use the Az/El sliders."); };
 $("simAz").oninput = () => $("simAzV").textContent = (+$("simAz").value).toFixed(1) + "°";
 $("simEl").oninput = () => $("simElV").textContent = (+$("simEl").value).toFixed(2) + "°";
+/* debug snapshot */
+function snapshot(){
+  const v = $("cam"), m = measured(), c = corrected();
+  const settings = {}; SAVED.concat(["sim","simAz","simEl"]).forEach(id => { const el = $(id); settings[id] = el.type === "checkbox" ? el.checked : el.value; });
+  let demHere = null; try { demHere = S.pos ? r3(elevAt(S.pos[0], S.pos[1])) : null; } catch(e){}
+  const f = S.lastFix;
+  return {
+    app:"sightline", build:"2026-11-04", at:new Date().toISOString(), tNow:Math.round(performance.now()),
+    env:{ ua:navigator.userAgent, secure:isSecureContext, screen:`${screen.width}x${screen.height}@${devicePixelRatio}`,
+      viewport:`${innerWidth}x${innerHeight}`, orient:screen.orientation ? `${screen.orientation.type} ${screen.orientation.angle}` : window.orientation,
+      hasAbsEvent:"ondeviceorientationabsolute" in window, video:v.videoWidth ? `${v.videoWidth}x${v.videoHeight}` : (v.hidden ? "off" : "no frames") },
+    heading:{ kind:S.kind, northOff:r3(S.northOff), northLocked:!!S.northLocked, absAz:r3(S.absAz), absAgeMs:S.absAt ? Math.round(performance.now() - S.absAt) : null,
+      relSeen:!!S.relSeen, cal:{ az:r3(S.cal.az), el:r3(S.cal.el) }, decl:+$("decl").value,
+      measured:m && { az:r3(m.az), el:r3(m.el) }, corrected:c && { az:r3(c.az), el:r3(c.el) },
+      axes:S.axes && S.axes.map(a => a.map(r3)), backVec:S.vec && S.vec.map(r3) },
+    position:{ pos:S.pos, acc:r3(S.acc), gpsAlt:r3(S.gpsAlt), demHere, observerH:r3(S.pos ? observerHeight() : null), hSrc:S.hSrc },
+    dem:{ z:dem.z, tilesLoaded:dem.loaded, tilesRequested:dem.tiles.size },
+    ar:{ on:$("arOn").checked, status:AR.status, ways:AR.ways.length, origin:AR.origin, visOrigin:AR.visOrigin, visH0:r3(AR.visH0) },
+    lastFix:f && { az:r3(f.az), el:r3(f.el), h0:r3(f.h0), obs:f.obs, missing:f.missing,
+      hit:f.hit && { lat:r3(f.hit.lat*100)/100, lon:r3(f.hit.lon*100)/100, d:r3(f.hit.d), elev:r3(f.hit.elev) },
+      sky:f.sky && { d:r3(f.sky.d), ang:r3(f.sky.ang), elev:r3(f.sky.elev) } },
+    locked:S.locked, settings, counts:DBG.counts,
+    raw:{ orientation:DBG.orient, orientationAbsolute:DBG.abs, gps:DBG.gps }, errors:DBG.errors,
+  };
+}
+function fillDbg(){ const t = $("dbgOut"); t.value = JSON.stringify(snapshot(), null, 1); return t; }
+$("btnDbgShow").onclick = () => { const t = fillDbg(); t.hidden = false; $("btnDbgShow").textContent = "Refresh"; };
+$("btnDbgCopy").onclick = () => {
+  const t = fillDbg(), b = $("btnDbgCopy");
+  const fallback = () => { t.hidden = false; t.focus(); t.select(); b.textContent = "Selected: copy manually"; };
+  try {
+    navigator.clipboard.writeText(t.value).then(() => { b.textContent = `Copied (${(t.value.length/1024).toFixed(1)} KB)`; setTimeout(() => b.textContent = "Copy snapshot", 2500); }, fallback);
+  } catch(e){ fallback(); }
+};
+
 /* persist settings in this browser */
 const SAVED = ["range","eye","useGpsAlt","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","layer"];
 let saved = {};

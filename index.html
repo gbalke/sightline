@@ -20,11 +20,17 @@
 html,body{height:100%;margin:0}
 body{background:var(--bg);color:var(--fg);font:15px/1.35 var(--sans);display:flex;flex-direction:column;
   padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);overflow:hidden}
-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  padding:8px max(12px,env(safe-area-inset-right,0px)) 8px max(12px,env(safe-area-inset-left,0px));border-bottom:1px solid var(--line)}
-header h1{font:600 17px var(--sans);letter-spacing:.06em;text-transform:uppercase;margin:0 auto 0 0}
-.chip{font:12px var(--mono);padding:2px 7px;border:1px solid var(--line);border-radius:3px;color:var(--dim);white-space:nowrap}
-.chip.ok{color:var(--ok);border-color:#2f5a3a}.chip.warn{color:var(--warn);border-color:#5a4a20}.chip.bad{color:var(--hit);border-color:#5a2a26}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--dim);flex:none}
+.dot.ok{background:var(--ok)}.dot.busy{background:var(--warn)}.dot.bad{background:var(--hit)}.dot.off{background:#4b5b5e}
+#statusBtn{position:absolute;top:8px;right:max(8px,env(safe-area-inset-right,0px));z-index:5;flex:none;width:40px;height:40px;padding:0;
+  border-radius:50%;background:rgba(15,21,23,.72);border:1px solid var(--line);display:grid;place-items:center}
+#statusBtn .dot{width:16px;height:16px;box-shadow:0 0 0 3px rgba(15,21,23,.6)}
+#statusPanel{position:absolute;top:54px;right:max(8px,env(safe-area-inset-right,0px));z-index:6;width:min(320px,calc(100% - 16px));
+  background:rgba(23,33,36,.97);border:1px solid var(--line);border-radius:6px;padding:6px 10px;box-shadow:0 4px 14px rgba(0,0,0,.45)}
+.st{display:grid;grid-template-columns:auto 84px 1fr;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line);font-size:13px}
+.st:last-child{border-bottom:0}
+.st b{font:600 11px var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+.st span{font:12px var(--mono);min-width:0;overflow-wrap:anywhere}
 #view{position:relative;flex:0 0 42%;background:
   repeating-linear-gradient(0deg,transparent 0 39px,#1c282b 39px 40px),
   repeating-linear-gradient(90deg,transparent 0 39px,#1c282b 39px 40px),var(--bg);overflow:hidden}
@@ -36,7 +42,7 @@ header h1{font:600 17px var(--sans);letter-spacing:.06em;text-transform:uppercas
 #roResult{left:max(10px,env(safe-area-inset-left,0px));right:max(10px,env(safe-area-inset-right,0px));bottom:10px;text-align:center}
 .big{font-size:17px;font-weight:600}
 .lbl{color:var(--dim);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
-#locked{position:absolute;right:max(10px,env(safe-area-inset-right,0px));top:10px;font:600 12px var(--mono);color:var(--bg);background:var(--reticle);padding:3px 7px;border-radius:3px;letter-spacing:.1em}
+#locked{position:absolute;right:max(56px,calc(env(safe-area-inset-right,0px) + 48px));top:17px;font:600 12px var(--mono);color:var(--bg);background:var(--reticle);padding:3px 7px;border-radius:3px;letter-spacing:.1em}
 #map{flex:1 1 auto;min-height:120px;background:#1a2326;z-index:0}
 [hidden]{display:none!important}
 #mapWrap{position:relative;flex:1 1 auto;min-height:120px;display:flex}
@@ -67,15 +73,9 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 </style>
 </head>
 <body>
-<header>
-  <h1>Sightline</h1>
-  <span id="chipGps" class="chip">GPS —</span>
-  <span id="chipCmp" class="chip">Compass —</span>
-  <span id="chipDem" class="chip">DEM 0</span>
-  <span id="chipAr" class="chip" hidden>AR —</span>
-</header>
-
 <div id="view">
+  <button id="statusBtn" aria-label="Status" aria-expanded="false" aria-controls="statusPanel"><span id="statusDot" class="dot off"></span></button>
+  <div id="statusPanel" hidden></div>
   <video id="cam" playsinline muted hidden></video>
   <canvas id="ar"></canvas>
   <svg id="reticle" viewBox="-75 -75 150 150" aria-hidden="true">
@@ -174,7 +174,7 @@ function tileXY(lat, lon, z){
 }
 
 /* ---------- DEM: AWS Terrarium tiles ---------- */
-const dem = { z:12, tiles:new Map(), loaded:0 };
+const dem = { z:12, tiles:new Map(), loaded:0, errors:0 };
 function demZoomFor(rangeKm){ return rangeKm <= 10 ? 13 : 12; }
 function loadTile(z, x, y){
   const n = 2**z; x = ((x % n) + n) % n;
@@ -193,7 +193,10 @@ function loadTile(z, x, y){
       }
       entry.data = out; dem.loaded++; updateChips(); res(entry);
     };
-    img.onerror = () => { entry.data = "err"; res(entry); };
+    img.onerror = () => {             // count the failure, then forget the tile after 15 s so the next request retries it
+      entry.data = "err"; dem.errors++; updateChips(); res(entry);
+      setTimeout(() => { if (dem.tiles.get(key) === entry){ dem.tiles.delete(key); dem.errors = Math.max(0, dem.errors - 1); } }, 15000);
+    };
     img.src = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
   });
   dem.tiles.set(key, entry);
@@ -362,18 +365,23 @@ async function start(){
         alt:r3(k.altitude), altAcc:r3(k.altitudeAccuracy), hdg:r3(k.heading), spd:r3(k.speed) });
       if ($("sim").checked) return;
       setObserver([p.coords.latitude, p.coords.longitude]);
-      S.acc = p.coords.accuracy; S.gpsAlt = p.coords.altitude; updateChips();
-    }, err => { toast("Location: " + err.message); updateChips(); }, { enableHighAccuracy:true, maximumAge:2000, timeout:20000 });
+      S.acc = p.coords.accuracy; S.gpsAlt = p.coords.altitude; S.gpsErr = null; updateChips();
+    }, err => { S.gpsErr = err.code === 1 ? "Location permission denied" : err.code === 3 ? "GPS timeout" : (err.message || "GPS error"); updateChips(); }, { enableHighAccuracy:true, maximumAge:2000, timeout:20000 });
   }
+  S.sensorsOn = true; S.startedAt = Date.now();
   if ($("camOn").checked) startCam();
-  S.sensorsOn = true;
 }
 let camStream = null;
 async function startCam(){
   try {
+    S.camErr = null; updateChips();
     camStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:"environment" } }, audio:false });
     $("cam").srcObject = camStream; $("cam").hidden = false; await $("cam").play();
-  } catch(e){ $("cam").hidden = true; toast("Camera unavailable: " + e.message); }
+  } catch(e){
+    $("cam").hidden = true; camStream = null;
+    S.camErr = e.name === "NotAllowedError" ? "Permission denied" : e.name === "NotFoundError" ? "No camera found" : (e.message || e.name);
+  }
+  updateChips();
 }
 function stopCam(){ if (camStream){ camStream.getTracks().forEach(t => t.stop()); camStream = null; } $("cam").hidden = true; }
 
@@ -523,24 +531,162 @@ async function overpass(q){
   AR.serverErrs = errs;
   throw new Error(errs.map(s => s.split(" ").pop()).join("/"));
 }
+/* ---- Mapbox Vector Tile decoder (just what street lines need) ---- */
+function mvtDecode(buf){
+  const b = new Uint8Array(buf), dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const vint = st => { let r = 0, s = 0, x; do { x = b[st.p++]; r += (x & 0x7f)*2**s; s += 7; } while (x & 0x80); return r; };
+  const fields = (st, end, fn) => {
+    while (st.p < end){
+      const key = vint(st), f = Math.floor(key/8), w = key & 7;
+      if (w === 0) fn(f, w, vint(st));
+      else if (w === 2){ const len = vint(st), e = st.p + len; fn(f, w, null, st.p, e); st.p = e; }
+      else if (w === 1){ fn(f, w, dv.getFloat64(st.p, true)); st.p += 8; }
+      else if (w === 5){ fn(f, w, dv.getFloat32(st.p, true)); st.p += 4; }
+      else throw new Error("bad wire type " + w);
+    }
+  };
+  const str = (s, e) => new TextDecoder().decode(b.subarray(s, e));
+  const packed = (s, e) => { const st = { p:s }, out = []; while (st.p < e) out.push(vint(st)); return out; };
+  const layers = {};
+  fields({ p:0 }, b.length, (f, w, v, s, e) => {
+    if (f !== 3 || w !== 2) return;
+    const L = { name:"", extent:4096, keys:[], values:[], features:[] };
+    fields({ p:s }, e, (f2, w2, v2, s2, e2) => {
+      if (f2 === 1) L.name = str(s2, e2);
+      else if (f2 === 3) L.keys.push(str(s2, e2));
+      else if (f2 === 5) L.extent = v2;
+      else if (f2 === 4){
+        let val = null;
+        fields({ p:s2 }, e2, (f3, w3, v3, s3, e3) => {
+          if (f3 === 1) val = str(s3, e3);
+          else if (f3 === 6) val = (v3 % 2) ? -(v3 + 1)/2 : v3/2;
+          else if (f3 === 7) val = !!v3; else val = v3;
+        });
+        L.values.push(val);
+      }
+      else if (f2 === 2) L.features.push({ s:s2, e:e2 });
+    });
+    L.features = L.features.map(({ s:fs, e:fe }) => {
+      const ft = { type:0, tags:[], geom:[] };
+      fields({ p:fs }, fe, (f4, w4, v4, s4, e4) => {
+        if (f4 === 3) ft.type = v4;
+        else if (f4 === 2) ft.tags = packed(s4, e4);
+        else if (f4 === 4) ft.geom = packed(s4, e4);
+      });
+      ft.props = {}; for (let i = 0; i + 1 < ft.tags.length; i += 2) ft.props[L.keys[ft.tags[i]]] = L.values[ft.tags[i+1]];
+      return ft;
+    });
+    layers[L.name] = L;
+  });
+  return layers;
+}
+/* line geometry → arrays of [x, y] in tile units */
+function mvtLines(geom){
+  const lines = []; let x = 0, y = 0, cur = null, i = 0;
+  const zz = n => (n % 2) ? -(n + 1)/2 : n/2;
+  while (i < geom.length){
+    const cmd = geom[i] & 7, cnt = geom[i] >> 3; i++;
+    if (cmd === 7){ continue; }
+    for (let k = 0; k < cnt; k++){
+      x += zz(geom[i++]); y += zz(geom[i++]);
+      if (cmd === 1){ cur = [[x, y]]; lines.push(cur); } else cur.push([x, y]);
+    }
+  }
+  return lines;
+}
+const OMT_CLASS = { motorway:"major", trunk:"major", primary:"major", secondary:"mid", tertiary:"mid",
+  minor:"minor", service:"minor", busway:"minor", track:"path", path:"path" };
+let ofmTemplate = null;
+async function fetchT(url, ms){
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
+  try { const r = await fetch(url, { signal:ctl.signal }); if (!r.ok) throw new Error(String(r.status)); return r; }
+  catch(e){ throw new Error(e.name === "AbortError" ? "timeout" : e.message); }
+  finally { clearTimeout(t); }
+}
+async function gunzipIfNeeded(buf){
+  const b = new Uint8Array(buf);
+  if (b[0] !== 0x1f || b[1] !== 0x8b || typeof DecompressionStream === "undefined") return buf;
+  return await new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+}
+/* OpenFreeMap (OpenMapTiles schema, z14): CDN-served, keyless, CORS-enabled. Returns raw polylines. */
+async function streetsFromTiles(lat, lon, r){
+  if (!ofmTemplate){
+    const tj = await (await fetchT("https://tiles.openfreemap.org/planet", 15000)).json();
+    if (!tj.tiles || !tj.tiles[0]) throw new Error("no tile URL");
+    ofmTemplate = tj.tiles[0];
+  }
+  const z = 14, n = 2**z, dLat = r/111320, dLon = r/(111320*Math.cos(lat*D2R));
+  const [x0, y0] = tileXY(lat + dLat, lon - dLon, z), [x1, y1] = tileXY(lat - dLat, lon + dLon, z);
+  const jobs = [];
+  for (let tx = Math.floor(x0); tx <= Math.floor(x1); tx++) for (let ty = Math.floor(y0); ty <= Math.floor(y1); ty++) jobs.push([tx, ty]);
+  const tiles = await Promise.all(jobs.map(async ([tx, ty]) => {
+    const url = ofmTemplate.replace("{z}", z).replace("{x}", ((tx % n) + n) % n).replace("{y}", ty);
+    let lastErr;
+    for (let attempt = 0; attempt < 2; attempt++){
+      try { return { tx, ty, layers:mvtDecode(await gunzipIfNeeded(await (await fetchT(url, 20000)).arrayBuffer())) }; }
+      catch(e){ lastErr = e; }
+    }
+    throw new Error("tile " + lastErr.message);
+  }));
+  const out = [];
+  for (const { tx, ty, layers } of tiles){
+    for (const lname of ["transportation", "transportation_name"]){
+      const L = layers[lname]; if (!L) continue;
+      const E = L.extent, labelOnly = lname === "transportation_name";
+      const toLL = ([x, y]) => {
+        const X = (tx + x/E)/n, Y = (ty + y/E)/n;
+        return { lat:Math.atan(Math.sinh(Math.PI*(1 - 2*Y)))*R2D, lon:X*360 - 180 };
+      };
+      for (const f of L.features){
+        if (f.type !== 2) continue;
+        const cls = OMT_CLASS[f.props.class]; if (!cls) continue;            // skips rail, ferry, construction
+        if (f.props.brunnel === "tunnel") continue;                          // underground: not visible
+        const name = labelOnly ? (f.props.name || f.props["name:latin"] || f.props.name_en || "") : "";
+        if (labelOnly && !name) continue;
+        for (const line of mvtLines(f.geom)){
+          let run = [];                                                      // keep only segments inside this tile (tiles overlap by a buffer)
+          for (let i = 0; i + 1 < line.length; i++){
+            const mx = (line[i][0] + line[i+1][0])/2, my = (line[i][1] + line[i+1][1])/2;
+            if (mx >= 0 && mx < E && my >= 0 && my < E){ if (!run.length) run.push(toLL(line[i])); run.push(toLL(line[i+1])); }
+            else if (run.length){ out.push({ name, cls, labelOnly, geometry:run }); run = []; }
+          }
+          if (run.length > 1) out.push({ name, cls, labelOnly, geometry:run });
+        }
+      }
+    }
+  }
+  return { ways:out, tiles:jobs.length };
+}
+async function streetsFromOverpass(lat, lon, r){
+  const q = `[out:json][timeout:25];way(around:${r},${lat},${lon})[highway~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|track|path|footway|cycleway|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"][tunnel!~"yes"];out geom;`;
+  const js = await overpass(q);
+  return { ways:js.elements.filter(w => w.geometry && w.geometry.length > 1)
+    .map(w => ({ name:(w.tags && w.tags.name) || "", cls:roadClass(w.tags.highway), geometry:w.geometry })) };
+}
 async function loadStreets(){
   if (!S.pos || AR.loading) return;
   AR.loading = true; AR.status = "loading"; updateChips();
   const r = +$("arRad").value, [lat, lon] = S.pos;
-  const q = `[out:json][timeout:25];way(around:${r},${lat},${lon})[highway~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|track|path|footway|cycleway|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"];out geom;`;
   try {
-    const js = await overpass(q);
+    let got, errs = [];
+    try { AR.server = "OpenFreeMap tiles"; updateChips(); got = await streetsFromTiles(lat, lon, r); AR.source = "OpenFreeMap"; }
+    catch(e){ errs.push("tiles " + e.message); }
+    if (!got){
+      try { got = await streetsFromOverpass(lat, lon, r); AR.source = "Overpass " + AR.server; }
+      catch(e){ errs.push("overpass " + e.message); throw new Error(errs.join("; ")); }
+    }
+    AR.sourceErrs = errs;
     await preload(lat, lon, r + 500);
     AR.origin = [lat, lon];
-    AR.ways = js.elements.filter(w => w.geometry && w.geometry.length > 1).map(w => {
-      const pts = [];
-      for (let i = 0; i < w.geometry.length - 1; i++){        // densify to ~25 m so roads drape over terrain
-        const a = w.geometry[i], b = w.geometry[i+1];
+    AR.ways = got.ways.map(w => {
+      const g = w.geometry, pts = [];
+      for (let i = 0; i < g.length - 1; i++){                  // densify to ~25 m so roads drape over terrain
+        const a = g[i], b = g[i+1];
         const [d] = distBear([a.lat, a.lon], [b.lat, b.lon]), n = Math.max(1, Math.ceil(d/25));
         for (let s = 0; s < n; s++) pts.push({ lat:a.lat + (b.lat - a.lat)*s/n, lon:a.lon + (b.lon - a.lon)*s/n });
       }
-      const l = w.geometry[w.geometry.length - 1]; pts.push({ lat:l.lat, lon:l.lon });
-      return { name:(w.tags && w.tags.name) || "", cls:roadClass(w.tags.highway), pts };
+      const l = g[g.length - 1]; pts.push({ lat:l.lat, lon:l.lon });
+      return { name:w.name, cls:w.cls, labelOnly:!!w.labelOnly, pts };
     });
     computeVisibility();
     AR.status = "ok"; AR.fails = 0; AR.retryAt = 0; AR.lastErr = null;
@@ -549,7 +695,7 @@ async function loadStreets(){
     AR.fails = (AR.fails || 0) + 1; AR.lastErr = e.message;
     AR.retryAt = Date.now() + Math.min(120000, 10000*2**(AR.fails - 1));
     AR.status = AR.ways.length ? "stale" : "error";
-    if (AR.fails === 1) toast("Street servers busy (" + e.message + "). Retrying automatically.");
+    if (AR.fails === 1) toast("Street data unavailable. Retrying automatically.");
   }
   AR.loading = false; updateChips();
 }
@@ -637,8 +783,10 @@ function drawAR(){
         if (pa[2] < near){ const t = (near - pa[2])/(pb[2] - pa[2]); pa = pa.map((x, k) => x + t*(pb[k] - x)); pen = false; }
         if (pb[2] < near){ const t = (near - pb[2])/(pa[2] - pb[2]); pb = pb.map((x, k) => x + t*(pa[k] - x)); }
         const sa = toScr(pa), sb = toScr(pb);
-        if (!pen){ arCx.moveTo(sa[0], sa[1]); pen = true; }
-        arCx.lineTo(sb[0], sb[1]);
+        if (!w.labelOnly){
+          if (!pen){ arCx.moveTo(sa[0], sa[1]); pen = true; }
+          arCx.lineTo(sb[0], sb[1]);
+        }
         if (pb[2] < near + 1e-6) pen = false;
         if (pass && w.name && sa[0] > 20 && sa[0] < W - 20 && sa[1] > 40 && sa[1] < H - 40){
           const dc = Math.hypot(sa[0] - W/2, sa[1] - H/2), prev = labels.get(w.name);
@@ -671,21 +819,62 @@ function maybeReloadStreets(){
 setInterval(maybeReloadStreets, 3000);
 
 /* ---------- UI ---------- */
+/* status: one dot, green = all working, yellow = something in progress or degraded, red = something failed */
+function statusItems(){
+  const sim = $("sim").checked, started = S.sensorsOn, since = S.startedAt ? (Date.now() - S.startedAt)/1000 : 0, it = [];
+  // location
+  if (sim) it.push(S.pos ? ["Location", "ok", "Simulated"] : ["Location", "busy", "Simulated: tap the map to place yourself"]);
+  else if (!started) it.push(["Location", "off", "Press Start"]);
+  else if (S.gpsErr && !S.pos) it.push(["Location", "bad", S.gpsErr]);
+  else if (!S.pos) it.push(["Location", "busy", "Waiting for GPS fix"]);
+  else it.push(["Location", S.acc <= 20 && !S.gpsErr ? "ok" : "busy", `±${Math.round(S.acc || 0)} m` + (S.gpsErr ? " · " + S.gpsErr : S.acc > 20 ? " (weak)" : "")]);
+  // heading
+  if (sim) it.push(["Heading", "ok", "Simulated sliders"]);
+  else if (!started) it.push(["Heading", "off", "Press Start"]);
+  else if (S.vec) it.push(["Heading", /compass only|waiting/.test(S.kind) ? "busy" : "ok", S.kind]);
+  else if (since > 4) it.push(["Heading", "bad", "No motion sensor data"]);
+  else it.push(["Heading", "busy", S.kind === "waiting for compass" ? "Waiting for compass" : "Starting sensors"]);
+  // elevation
+  const pending = [...dem.tiles.values()].filter(t => !t.data).length;
+  if (dem.errors) it.push(["Elevation", "bad", `${dem.errors} tile${dem.errors > 1 ? "s" : ""} failed, retrying`]);
+  else if (pending) it.push(["Elevation", "busy", `Loading ${pending} tile${pending > 1 ? "s" : ""}`]);
+  else if (dem.loaded) it.push(["Elevation", "ok", `${dem.loaded} tiles · z${dem.z}`]);
+  else it.push(["Elevation", "off", "Waiting for location"]);
+  // height source
+  if (S.pos){
+    const h = observerHeight(), noAlt = /no GPS/.test(S.hSrc || "");
+    if (h === null) it.push(["Height", "busy", "Waiting for elevation data"]);
+    else it.push(["Height", noAlt ? "busy" : "ok", `${h.toFixed(0)} m · ` + (noAlt ? "no GPS altitude, using DEM" : S.hSrc)]);
+  }
+  // camera
+  if ($("camOn").checked){
+    if (!started) it.push(["Camera", "off", "Press Start"]);
+    else if (S.camErr) it.push(["Camera", "bad", S.camErr]);
+    else if (camStream) it.push(["Camera", "ok", $("cam").videoWidth ? `${$("cam").videoWidth}×${$("cam").videoHeight}` : "Running"]);
+    else it.push(["Camera", "busy", "Starting"]);
+  }
+  // AR streets
+  if ($("arOn").checked){
+    const wait = AR.retryAt ? Math.max(0, Math.ceil((AR.retryAt - Date.now())/1000)) : 0;
+    const drawn = AR.ways.filter(w => !w.labelOnly).length;
+    if (!S.pos) it.push(["Streets", "off", "Waiting for location"]);
+    else if (AR.status === "loading") it.push(["Streets", "busy", `Loading from ${AR.server || "server"}`]);
+    else if (AR.status === "error") it.push(["Streets", "bad", `Failed, retry in ${wait}s`]);
+    else if (AR.status === "stale") it.push(["Streets", "busy", `${drawn} roads (old area) · retry ${wait}s`]);
+    else if (AR.status === "ok") it.push(["Streets", "ok", `${drawn} roads · ${AR.source}`]);
+    else it.push(["Streets", "busy", "Starting"]);
+  }
+  return it;
+}
 function updateChips(){
-  const g = $("chipGps");
-  if ($("sim").checked){ g.textContent = "SIM"; g.className = "chip warn"; }
-  else if (S.pos){ g.textContent = `GPS ±${Math.round(S.acc || 0)} m`; g.className = "chip " + (S.acc < 15 ? "ok" : "warn"); }
-  const c = $("chipCmp");
-  if ($("sim").checked){ c.textContent = "Compass SIM"; c.className = "chip warn"; }
-  else if (S.vec){ c.textContent = S.kind; c.className = "chip " + (/compass only|waiting/.test(S.kind) ? "warn" : "ok"); }
-  else if (S.kind === "waiting for compass"){ c.textContent = "Waiting for compass"; c.className = "chip warn"; }
-  $("chipDem").textContent = `DEM z${dem.z} · ${dem.loaded}`;
-  const a = $("chipAr"); a.hidden = !$("arOn").checked;
-  const wait = AR.retryAt ? Math.max(0, Math.ceil((AR.retryAt - Date.now())/1000)) : 0;
-  a.textContent = AR.status === "loading" ? `AR loading…` :
-    AR.status === "error" ? `AR retry ${wait}s` :
-    AR.status === "stale" ? `AR ${AR.ways.length} roads · retry ${wait}s` : `AR ${AR.ways.length} roads`;
-  a.className = "chip " + (AR.status === "error" ? "bad" : AR.status === "ok" ? "ok" : "warn");
+  const it = statusItems(), lv = it.map(x => x[1]);
+  const overall = lv.includes("bad") ? "bad" : lv.includes("busy") ? "busy" : lv.includes("ok") ? "ok" : "off";
+  $("statusDot").className = "dot " + overall;
+  $("statusBtn").setAttribute("aria-label", "Status: " + { ok:"all working", busy:"in progress", bad:"something failed", off:"not started" }[overall]);
+  if (!$("statusPanel").hidden){
+    $("statusPanel").innerHTML = it.map(([n, l, t]) => `<div class="st"><i class="dot ${l}"></i><b>${n}</b><span></span></div>`).join("");
+    $("statusPanel").querySelectorAll(".st span").forEach((s, i) => s.textContent = it[i][2]);
+  }
   $("calShow").textContent = `az ${S.cal.az >= 0 ? "+" : ""}${S.cal.az.toFixed(1)}° · el ${S.cal.el >= 0 ? "+" : ""}${S.cal.el.toFixed(2)}°`;
 }
 let toastT;
@@ -734,7 +923,7 @@ $("btnCalReset").onclick = () => { S.cal = { az:0, el:0 }; S.northLocked = false
 $("decl").onchange = () => { try { localStorage.setItem("sightline.decl", $("decl").value); } catch(e){} };
 $("range").onchange = () => {
   const z = demZoomFor(+$("range").value);
-  if (z !== dem.z){ dem.z = z; dem.loaded = 0; dem.tiles.clear(); }
+  if (z !== dem.z){ dem.z = z; dem.loaded = 0; dem.errors = 0; dem.tiles.clear(); }
   if (S.pos) preload(S.pos[0], S.pos[1], rangeM());
 };
 $("camOn").onchange = () => { if ($("camOn").checked){ if (S.sensorsOn) startCam(); } else stopCam(); };
@@ -744,6 +933,14 @@ $("layer").onchange = () => { Object.values(layers).forEach(l => map.removeLayer
 $("sim").onchange = () => { updateChips(); if ($("sim").checked) toast("Simulate on: tap the map to place yourself, then use the Az/El sliders."); };
 $("simAz").oninput = () => $("simAzV").textContent = (+$("simAz").value).toFixed(1) + "°";
 $("simEl").oninput = () => $("simElV").textContent = (+$("simEl").value).toFixed(2) + "°";
+/* status panel */
+$("statusBtn").onclick = e => {
+  e.stopPropagation();
+  const p = $("statusPanel"); p.hidden = !p.hidden; $("statusBtn").setAttribute("aria-expanded", String(!p.hidden)); updateChips();
+};
+document.addEventListener("click", e => { if (!$("statusPanel").hidden && !$("statusPanel").contains(e.target)){ $("statusPanel").hidden = true; $("statusBtn").setAttribute("aria-expanded", "false"); } });
+setInterval(updateChips, 1000);
+
 /* debug snapshot */
 function snapshot(){
   const v = $("cam"), m = measured(), c = corrected();
@@ -760,8 +957,8 @@ function snapshot(){
       measured:m && { az:r3(m.az), el:r3(m.el) }, corrected:c && { az:r3(c.az), el:r3(c.el) },
       axes:S.axes && S.axes.map(a => a.map(r3)), backVec:S.vec && S.vec.map(r3) },
     position:{ pos:S.pos, acc:r3(S.acc), gpsAlt:r3(S.gpsAlt), demHere, observerH:r3(S.pos ? observerHeight() : null), hSrc:S.hSrc },
-    dem:{ z:dem.z, tilesLoaded:dem.loaded, tilesRequested:dem.tiles.size },
-    ar:{ on:$("arOn").checked, status:AR.status, server:AR.server, fails:AR.fails, lastErr:AR.lastErr, serverErrs:AR.serverErrs,
+    dem:{ z:dem.z, tilesLoaded:dem.loaded, tilesRequested:dem.tiles.size, errors:dem.errors }, status:statusItems(), gpsErr:S.gpsErr, camErr:S.camErr,
+    ar:{ on:$("arOn").checked, status:AR.status, source:AR.source, sourceErrs:AR.sourceErrs, server:AR.server, fails:AR.fails, lastErr:AR.lastErr, serverErrs:AR.serverErrs,
       retryInS:AR.retryAt ? Math.round((AR.retryAt - Date.now())/1000) : null, ways:AR.ways.length, origin:AR.origin, visOrigin:AR.visOrigin, visH0:r3(AR.visH0) },
     lastFix:f && { az:r3(f.az), el:r3(f.el), h0:r3(f.h0), obs:f.obs, missing:f.missing,
       hit:f.hit && { lat:r3(f.hit.lat*100)/100, lon:r3(f.hit.lon*100)/100, d:r3(f.hit.d), elev:r3(f.hit.elev) },

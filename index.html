@@ -113,7 +113,12 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <h2>Ray</h2>
   <div class="row"><label for="range">Max range (km)</label><select id="range"><option>5</option><option>10</option><option selected>20</option><option>40</option></select></div>
   <div class="row"><label for="eye">Eye height above ground (m)</label><input id="eye" type="number" step="0.1" value="1.6"></div>
-  <div class="row"><label for="useGpsAlt">Use GPS altitude instead of DEM</label><input id="useGpsAlt" type="checkbox"></div>
+  <div class="row"><label for="hSource">Height source</label><select id="hSource"><option value="auto" selected>Auto</option><option value="dem">Ground + eye height</option><option value="gps">GPS always</option></select></div>
+  <div class="row"><label for="gpsMaxErr">Auto: max GPS vertical error (m)</label><input id="gpsMaxErr" type="number" step="1" min="1" value="8"></div>
+  <div class="row"><label for="gpsOff">GPS height offset (m)</label><input id="gpsOff" type="number" step="0.1" value="0"></div>
+  <div class="row"><span>GPS now</span><span id="gpsNow" class="mono">—</span></div>
+  <div class="row"><button id="btnZeroGps">I'm on the ground: zero GPS height here</button></div>
+  <p class="note">Auto uses GPS altitude only while the phone reports a vertical accuracy within the limit above and the reading doesn't put you underground; otherwise it uses ground height plus eye height. Eye height is ignored when GPS is used. GPS altitude on Android may be measured from the ellipsoid rather than sea level, which differs by tens of metres in some places: stand at ground level outdoors once and press the zero button to measure and remove that offset.</p>
   <div class="row"><label for="refr">Refraction coefficient k</label><input id="refr" type="number" step="0.01" value="0.13"></div>
 
   <h2>Uncertainty box</h2>
@@ -365,24 +370,44 @@ async function start(){
         alt:r3(k.altitude), altAcc:r3(k.altitudeAccuracy), hdg:r3(k.heading), spd:r3(k.speed) });
       if ($("sim").checked) return;
       setObserver([p.coords.latitude, p.coords.longitude]);
-      S.acc = p.coords.accuracy; S.gpsAlt = p.coords.altitude; S.gpsErr = null; updateChips();
+      S.acc = p.coords.accuracy; S.gpsAlt = p.coords.altitude; S.gpsAltAcc = p.coords.altitudeAccuracy; S.gpsErr = null;
+      gpsAltUpdate(p.coords.altitude, p.coords.altitudeAccuracy);
+      updateChips();
     }, err => { S.gpsErr = err.code === 1 ? "Location permission denied" : err.code === 3 ? "GPS timeout" : (err.message || "GPS error"); updateChips(); }, { enableHighAccuracy:true, maximumAge:2000, timeout:20000 });
   }
   S.sensorsOn = true; S.startedAt = Date.now();
   if ($("camOn").checked) startCam();
 }
-let camStream = null;
+let camStream = null, camStarting = false;
 async function startCam(){
+  if (camStarting) return; camStarting = true;
   try {
     S.camErr = null; updateChips();
     camStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:"environment" } }, audio:false });
+    camStream.getVideoTracks().forEach(t => t.addEventListener("ended", () => { if (!document.hidden) restartCam(); }));
     $("cam").srcObject = camStream; $("cam").hidden = false; await $("cam").play();
   } catch(e){
     $("cam").hidden = true; camStream = null;
     S.camErr = e.name === "NotAllowedError" ? "Permission denied" : e.name === "NotFoundError" ? "No camera found" : (e.message || e.name);
   }
+  camStarting = false;
   updateChips();
 }
+function restartCam(){ stopCam(); if ($("camOn").checked && S.sensorsOn) startCam(); }
+function camHealthy(){
+  if (!camStream) return false;
+  const t = camStream.getVideoTracks()[0], v = $("cam");
+  return !!t && t.readyState === "live" && !t.muted && !v.paused;
+}
+/* Chrome suspends the camera when the tab is hidden and doesn't always give it back. Release it on the
+   way out (saves battery too) and start a fresh stream on the way back. */
+document.addEventListener("visibilitychange", () => {
+  if (!$("camOn").checked || !S.sensorsOn) return;
+  if (document.hidden) stopCam();
+  else if (!camHealthy()) startCam();
+});
+addEventListener("pageshow", e => { if (e.persisted && $("camOn").checked && S.sensorsOn && !camHealthy()) restartCam(); });
+setInterval(() => { if (!document.hidden && $("camOn").checked && S.sensorsOn && !camStarting && !S.camErr && !camHealthy()) restartCam(); }, 3000);
 function stopCam(){ if (camStream){ camStream.getTracks().forEach(t => t.stop()); camStream = null; } $("cam").hidden = true; }
 
 /* ---------- map ---------- */
@@ -423,14 +448,46 @@ map.on("click", e => {
 const rangeM = () => (+$("range").value)*1000;
 
 /* ---------- main loop ---------- */
+/* GPS altitude: inverse-variance weighted mean of the fixes from the last 20 s that report a vertical accuracy */
+const GALT = [];
+function gpsAltUpdate(alt, acc){
+  const now = Date.now();
+  if (alt != null && isFinite(alt)) GALT.push({ t:now, alt, acc:(acc != null && isFinite(acc) && acc > 0) ? acc : null });
+  while (GALT.length && now - GALT[0].t > 20000) GALT.shift();
+}
+function gpsAltEstimate(){
+  const now = Date.now(), fresh = GALT.filter(g => now - g.t < 20000);
+  if (!fresh.length) return null;
+  const withAcc = fresh.filter(g => g.acc);
+  const last = fresh[fresh.length - 1];
+  if (!withAcc.length) return { h:last.alt - (+$("gpsOff").value || 0), raw:last.alt, acc:null, n:fresh.length, age:(now - last.t)/1000 };
+  let sw = 0, sh = 0; withAcc.forEach(g => { const w = 1/(g.acc*g.acc); sw += w; sh += w*g.alt; });
+  // representative accuracy of the weighted fixes (RMS in inverse-variance terms); deliberately not shrunk by
+  // sqrt(n), because successive GPS fixes share most of their error
+  const raw = sh/sw, acc = Math.sqrt(withAcc.length/sw);
+  return { h:raw - (+$("gpsOff").value || 0), raw, acc, n:withAcc.length, age:(now - last.t)/1000 };
+}
 function observerHeight(){
   if (!S.pos) return null;
-  if ($("useGpsAlt").checked){
-    if (S.gpsAlt != null){ S.hSrc = "GPS"; return S.gpsAlt; }
-    S.hSrc = "DEM (no GPS alt)";
-  } else S.hSrc = "DEM + " + (+$("eye").value || 0) + " m";
-  const g = elevAt(S.pos[0], S.pos[1]);
-  return g === null ? null : g + (+$("eye").value || 0);
+  const mode = $("hSource").value, eye = +$("eye").value || 0, g = elevAt(S.pos[0], S.pos[1]), G = gpsAltEstimate();
+  const maxErr = +$("gpsMaxErr").value || 8;
+  const demH = g === null ? null : g + eye;
+  S.hLevel = "ok";
+  if (mode === "gps"){
+    if (G){ S.hSrc = "GPS" + (G.acc ? ` ±${G.acc.toFixed(0)} m` : " (accuracy unknown)"); S.hUsing = "gps"; return G.h; }
+    S.hSrc = "no GPS altitude, using ground + " + eye + " m"; S.hLevel = "busy"; S.hUsing = "dem"; return demH;
+  }
+  if (mode === "auto"){
+    let why;
+    if (!G) why = "no GPS altitude";
+    else if (!G.acc) why = "GPS altitude has no accuracy figure";
+    else if (G.acc > maxErr) why = `GPS ±${G.acc.toFixed(0)} m > ${maxErr} m`;
+    else if (g !== null && G.h < g - 3 - G.acc) why = `GPS puts you ${(g - G.h).toFixed(0)} m underground`;
+    if (!why){ S.hSrc = `GPS ±${G.acc.toFixed(0)} m` + (g !== null ? `, ${(G.h - g).toFixed(0)} m above ground` : ""); S.hUsing = "gps"; return G.h; }
+    S.hSrc = `ground + ${eye} m (${why})`; S.hUsing = "dem"; return demH;
+  }
+  S.hSrc = "ground + " + eye + " m"; S.hUsing = "dem";
+  return demH;
 }
 function fmtKm(d){ return d < 1000 ? d.toFixed(0) + " m" : (d/1000).toFixed(d < 10000 ? 2 : 1) + " km"; }
 
@@ -441,7 +498,10 @@ function tick(){
     const hh = observerHeight();
     $("hgt").textContent = hh === null ? "—" : hh.toFixed(0) + " m";
     $("hsrc").textContent = S.hSrc || "";
-    $("hsrc").style.color = /no GPS/.test(S.hSrc) ? "var(--warn)" : "";
+    $("hsrc").textContent = S.hUsing === "gps" ? "GPS" : "GND+EYE";
+    $("hsrc").style.color = S.hLevel === "busy" ? "var(--warn)" : "";
+    const G = gpsAltEstimate();
+    $("gpsNow").textContent = G ? `${G.raw.toFixed(1)} m raw` + (G.acc ? ` ±${G.acc.toFixed(0)}` : " ±?") + ` · ${G.n} fixes` : "no altitude yet";
   }
   if (S.locked || !c || !S.pos){ updateChips(); return; }
   const h0 = observerHeight();
@@ -815,7 +875,7 @@ function maybeReloadStreets(){
       computeVisibility();
   }
 }
-["eye", "useGpsAlt", "refr"].forEach(id => $(id).addEventListener("change", maybeReloadStreets));
+["eye", "hSource", "gpsMaxErr", "gpsOff", "refr"].forEach(id => $(id).addEventListener("change", maybeReloadStreets));
 setInterval(maybeReloadStreets, 3000);
 
 /* ---------- UI ---------- */
@@ -842,9 +902,9 @@ function statusItems(){
   else it.push(["Elevation", "off", "Waiting for location"]);
   // height source
   if (S.pos){
-    const h = observerHeight(), noAlt = /no GPS/.test(S.hSrc || "");
+    const h = observerHeight();
     if (h === null) it.push(["Height", "busy", "Waiting for elevation data"]);
-    else it.push(["Height", noAlt ? "busy" : "ok", `${h.toFixed(0)} m · ` + (noAlt ? "no GPS altitude, using DEM" : S.hSrc)]);
+    else it.push(["Height", S.hLevel || "ok", `${h.toFixed(0)} m · ${S.hSrc}`]);
   }
   // camera
   if ($("camOn").checked){
@@ -933,6 +993,17 @@ $("layer").onchange = () => { Object.values(layers).forEach(l => map.removeLayer
 $("sim").onchange = () => { updateChips(); if ($("sim").checked) toast("Simulate on: tap the map to place yourself, then use the Az/El sliders."); };
 $("simAz").oninput = () => $("simAzV").textContent = (+$("simAz").value).toFixed(1) + "°";
 $("simEl").oninput = () => $("simElV").textContent = (+$("simEl").value).toFixed(2) + "°";
+/* zero the GPS height offset while standing on the ground */
+$("btnZeroGps").onclick = () => {
+  const G = gpsAltEstimate(), g = S.pos ? elevAt(S.pos[0], S.pos[1]) : null;
+  if (!G){ toast("No GPS altitude yet. Go outdoors with a clear sky and try again."); return; }
+  if (g === null){ toast("Elevation data still loading. Try again in a moment."); return; }
+  if (G.acc && G.acc > 15){ toast(`GPS vertical accuracy is ±${G.acc.toFixed(0)} m right now. Wait for it to improve, then try again.`); return; }
+  $("gpsOff").value = (G.raw - (g + (+$("eye").value || 0))).toFixed(1);
+  $("gpsOff").dispatchEvent(new Event("change"));
+  toast(`GPS offset set to ${$("gpsOff").value} m.`);
+};
+
 /* status panel */
 $("statusBtn").onclick = e => {
   e.stopPropagation();
@@ -956,7 +1027,7 @@ function snapshot(){
       relSeen:!!S.relSeen, cal:{ az:r3(S.cal.az), el:r3(S.cal.el) }, decl:+$("decl").value,
       measured:m && { az:r3(m.az), el:r3(m.el) }, corrected:c && { az:r3(c.az), el:r3(c.el) },
       axes:S.axes && S.axes.map(a => a.map(r3)), backVec:S.vec && S.vec.map(r3) },
-    position:{ pos:S.pos, acc:r3(S.acc), gpsAlt:r3(S.gpsAlt), demHere, observerH:r3(S.pos ? observerHeight() : null), hSrc:S.hSrc },
+    position:{ pos:S.pos, acc:r3(S.acc), gpsAlt:r3(S.gpsAlt), gpsAltAcc:r3(S.gpsAltAcc), gpsEst:gpsAltEstimate(), hUsing:S.hUsing, demHere, observerH:r3(S.pos ? observerHeight() : null), hSrc:S.hSrc },
     dem:{ z:dem.z, tilesLoaded:dem.loaded, tilesRequested:dem.tiles.size, errors:dem.errors }, status:statusItems(), gpsErr:S.gpsErr, camErr:S.camErr,
     ar:{ on:$("arOn").checked, status:AR.status, source:AR.source, sourceErrs:AR.sourceErrs, server:AR.server, fails:AR.fails, lastErr:AR.lastErr, serverErrs:AR.serverErrs,
       retryInS:AR.retryAt ? Math.round((AR.retryAt - Date.now())/1000) : null, ways:AR.ways.length, origin:AR.origin, visOrigin:AR.visOrigin, visH0:r3(AR.visH0) },
@@ -978,7 +1049,7 @@ $("btnDbgCopy").onclick = () => {
 };
 
 /* persist settings in this browser */
-const SAVED = ["range","eye","useGpsAlt","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","layer"];
+const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","layer"];
 let saved = {};
 const STORE = { raw:null, readErr:null, writeErr:null, writes:0, restored:[], mismatched:[] };
 try { STORE.raw = localStorage.getItem("sightline.settings"); saved = JSON.parse(STORE.raw) || {}; } catch(e){ STORE.readErr = String(e); }

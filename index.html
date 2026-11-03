@@ -648,6 +648,19 @@ $("layer").onchange = () => { Object.values(layers).forEach(l => map.removeLayer
 $("sim").onchange = () => { updateChips(); if ($("sim").checked) toast("Simulate on: tap the map to place yourself, then use the Az/El sliders."); };
 $("simAz").oninput = () => $("simAzV").textContent = (+$("simAz").value).toFixed(1) + "°";
 $("simEl").oninput = () => $("simElV").textContent = (+$("simEl").value).toFixed(2) + "°";
+/* persist settings in this browser */
+const SAVED = ["range","eye","useGpsAlt","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","layer"];
+let saved = {};
+try { saved = JSON.parse(localStorage.getItem("sightline.settings")) || {}; } catch(e){}
+SAVED.forEach(id => {
+  const el = $(id);
+  if (id in saved){ if (el.type === "checkbox") el.checked = !!saved[id]; else el.value = saved[id]; }
+  el.addEventListener("change", () => {
+    saved[id] = el.type === "checkbox" ? el.checked : el.value;
+    try { localStorage.setItem("sightline.settings", JSON.stringify(saved)); } catch(e){}
+  });
+});
+if ($("layer").value !== "topo"){ map.removeLayer(layers.topo); layers[$("layer").value].addTo(map); }
 dem.z = demZoomFor(+$("range").value);
 updateChips();
 if (!window.isSecureContext) toast("This page needs HTTPS for GPS, compass and camera.");

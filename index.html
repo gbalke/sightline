@@ -137,8 +137,11 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div class="row"><label for="arOn">AR street overlay</label><input id="arOn" type="checkbox"></div>
   <div class="row"><label for="arRad">Street radius (m)</label><select id="arRad"><option>800</option><option selected>1500</option><option>3000</option></select></div>
   <div class="row"><label for="fov">Camera FOV, long side (°)</label><input id="fov" type="number" step="1" value="66"></div>
-  <div class="row"><label for="arHidden">Show streets hidden by terrain (faint)</label><input id="arHidden" type="checkbox" checked></div>
-  <p class="note">If overlay streets look stretched or squeezed relative to the real ones, adjust FOV. If they are shifted sideways or up/down, calibrate on a landmark. Street data © OpenStreetMap contributors.</p>
+  <div class="row"><label for="arHidden">Also show streets hidden by terrain (faint)</label><input id="arHidden" type="checkbox"></div>
+  <div class="row"><label for="topoOn">AR contour lines</label><input id="topoOn" type="checkbox"></div>
+  <div class="row"><label for="topoInt">Contour interval</label><select id="topoInt"><option value="auto" selected>Auto</option><option value="5">5 m</option><option value="10">10 m</option><option value="20">20 m</option><option value="25">25 m</option><option value="50">50 m</option><option value="100">100 m</option></select></div>
+  <div class="row"><label for="topoRange">Contour range</label><select id="topoRange"><option value="1000">1 km</option><option value="2000">2 km</option><option value="3000" selected>3 km</option><option value="5000">5 km</option></select></div>
+  <p class="note">If overlay streets look stretched or squeezed relative to the real ones, adjust FOV. If they are shifted sideways or up/down, calibrate on a landmark. Contours are drawn from the same elevation data as the ray, every fifth line thicker and labelled; anything hidden behind terrain is left out. Buildings and trees are not in the elevation data, so they don't hide anything. Street data © OpenStreetMap contributors.</p>
   <div class="row"><label for="layer">Map</label><select id="layer"><option value="topo">Topo</option><option value="sat">Satellite</option></select></div>
 
   <h2>Simulate (no sensors)</h2>
@@ -759,30 +762,159 @@ async function loadStreets(){
   }
   AR.loading = false; updateChips();
 }
-/* Per vertex: road-surface height (p.g) and terrain visibility. Screen positions are recomputed every frame from
-   the current position and observer height; visibility is recomputed when position, height or refraction change. */
-function computeVisibility(){
-  const h0 = observerHeight(); if (h0 === null){ setTimeout(computeVisibility, 500); return; }
-  const k = +$("refr").value || 0, curv = (1 - k)/(2*RE), obs = S.pos.slice(), cosL = Math.cos(obs[0]*D2R);
-  AR.visOrigin = obs; AR.visH0 = h0; AR.visK = k;
-  const all = []; AR.ways.forEach(w => w.pts.forEach(p => all.push(p)));
-  const job = ++AR.visQueue; let i = 0;
+/* ---------- terrain occlusion: one horizon sweep, shared by streets and contours ----------
+   For NA bearings around the observer, march outward and keep the running maximum terrain "slope"
+   (height above eye, minus curvature, over distance). A point is visible when its own slope reaches the
+   maximum slope of everything nearer than it on that bearing. */
+const HZ = { job:0, ready:null, building:false };
+function hzDistances(R){ const ds = []; let d = 15; while (d <= R){ ds.push(d); d += Math.min(Math.max(d*0.012, 8), 60); } return ds; }
+function buildHorizon(obs, h0, k, R){
+  const NA = 1440, ds = hzDistances(R), ND = ds.length, cm = new Float32Array(NA*ND), curv = (1 - k)/(2*RE);
+  const cosL = Math.cos(obs[0]*D2R), job = ++HZ.job; let a = 0, missing = 0;
+  HZ.building = true; updateChips();
   (function batch(){
-    if (job !== AR.visQueue) return;
-    const end = Math.min(i + 400, all.length);
-    for (; i < end; i++){
-      const p = all[i], T = elevAt(p.lat, p.lon);
-      const e = (p.lon - obs[1])*D2R*RE*cosL, n = (p.lat - obs[0])*D2R*RE, d = Math.hypot(e, n);
-      const g = (T === null ? h0 - (+$("eye").value || 0) : T) + 0.5;   // half a metre above the road surface
-      p.g = g;
-      if (d < 30) { p.vis = true; continue; }
-      const ang = Math.atan2(g - h0 - curv*d*d, d)*R2D, brg = norm360(Math.atan2(e, n)*R2D);
-      const r = castRay(obs, h0, brg, ang, d - 25, k, elevAt);
-      p.vis = !r.hit;
+    if (job !== HZ.job) return;
+    const end = Math.min(a + 60, NA);
+    for (; a < end; a++){
+      const az = a*2*Math.PI/NA, se = Math.sin(az), cn = Math.cos(az); let m = -Infinity;
+      for (let i = 0; i < ND; i++){
+        const d = ds[i], T = elevAt(obs[0] + d*cn/RE*R2D, obs[1] + d*se/(RE*cosL)*R2D);
+        if (T === null) missing++;
+        else { const sl = (T - h0 - curv*d*d)/d; if (sl > m) m = sl; }
+        cm[a*ND + i] = m;
+      }
     }
-    if (i < all.length) setTimeout(batch, 0);
+    if (a < NA){ setTimeout(batch, 0); return; }
+    HZ.ready = { obs, h0, k, R, ds, ND, NA, cm, curv, cosL, missing, demLoaded:dem.loaded, at:Date.now() };
+    HZ.building = false;
+    applyVisibility(); updateChips();
   })();
 }
+function hzVisible(H, lat, lon, g){
+  const e = (lon - H.obs[1])*D2R*RE*H.cosL, n = (lat - H.obs[0])*D2R*RE, d = Math.hypot(e, n);
+  if (d < 40) return true;
+  const a = Math.round(norm360(Math.atan2(e, n)*R2D)*H.NA/360) % H.NA;
+  const dd = d - Math.max(20, d*0.01);                   // occluders strictly nearer than the point's own neighbourhood
+  let lo = 0, hi = H.ND - 1, i = -1;
+  while (lo <= hi){ const m = (lo + hi) >> 1; if (H.ds[m] <= dd){ i = m; lo = m + 1; } else hi = m - 1; }
+  if (i < 0) return true;
+  const sl = (g - H.h0 - H.curv*d*d)/d;
+  return sl >= H.cm[a*H.ND + i] - 2/d;                   // 2 m tolerance for DEM vs. surface mismatch
+}
+function applyVisibility(){
+  const H = HZ.ready;
+  for (const w of AR.ways) for (const p of w.pts){
+    if (p.g == null){ const T = elevAt(p.lat, p.lon); p.g = T === null ? null : T + 0.5; }   // half a metre above the road surface
+    p.vis = H && p.g != null ? hzVisible(H, p.lat, p.lon, p.g) : undefined;
+  }
+  for (const L of TOPO.lines) for (const p of L.pts) p.vis = H ? hzVisible(H, p.lat, p.lon, p.g) : undefined;
+  if (H){ AR.visOrigin = H.obs; AR.visH0 = H.h0; AR.visK = H.k; }
+}
+function computeVisibility(){ applyVisibility(); overlayTick(); }   // called when new streets arrive
+
+/* ---------- contour lines from the elevation model ---------- */
+const TOPO = { lines:[], origin:null, building:false, interval:null, key:"", job:0 };
+function niceInterval(relief){
+  const want = relief/25;
+  for (const v of [5, 10, 20, 25, 50, 100, 200, 250, 500]) if (v >= want) return v;
+  return 1000;
+}
+async function buildContours(){
+  if (!S.pos) return;
+  const R = +$("topoRange").value, obs = S.pos.slice(), job = ++TOPO.job, key = R + "|" + $("topoInt").value;
+  TOPO.building = true; updateChips();
+  await preload(obs[0], obs[1], R + 300);
+  if (job !== TOPO.job) return;
+  const N = Math.round(Math.min(220, Math.max(100, 2*R/30))), sp = 2*R/N, W = N + 1, cosL = Math.cos(obs[0]*D2R);
+  const llOf = (e, n) => ({ lat:obs[0] + n/RE*R2D, lon:obs[1] + e/(RE*cosL)*R2D });
+  const v = new Float32Array(W*W); let mn = Infinity, mx = -Infinity;
+  for (let j = 0; j < W; j++) for (let i = 0; i < W; i++){
+    const ll = llOf(-R + i*sp, -R + j*sp), T = elevAt(ll.lat, ll.lon);
+    v[j*W + i] = T === null ? NaN : T;
+    if (T !== null){ if (T < mn) mn = T; if (T > mx) mx = T; }
+  }
+  if (!isFinite(mn)){ TOPO.building = false; updateChips(); return; }
+  const iv = $("topoInt").value === "auto" ? niceInterval(mx - mn) : +$("topoInt").value;
+  const levels = []; for (let L = Math.ceil(mn/iv)*iv; L <= mx; L += iv) levels.push(L);
+  const lines = []; let li = 0;
+  // edge ids: horizontal edge (i,j)-(i+1,j) = 2*(j*W+i); vertical edge (i,j)-(i,j+1) = 2*(j*W+i)+1
+  const CASES = { 1:[["b","l"]], 2:[["b","r"]], 3:[["l","r"]], 4:[["r","t"]], 6:[["b","t"]], 7:[["l","t"]], 8:[["t","l"]],
+    9:[["b","t"]], 11:[["r","t"]], 12:[["l","r"]], 13:[["b","r"]], 14:[["b","l"]] };
+  (function batch(){
+    if (job !== TOPO.job) return;
+    const stopAt = performance.now() + 25;
+    while (li < levels.length && performance.now() < stopAt){
+      const L = levels[li++], major = Math.round(L/iv) % 5 === 0, pos = new Map(), adj = new Map(), segs = [];
+      const pt = id => {
+        let q = pos.get(id); if (q) return q;
+        const c = id >> 1, i = c % W, j = (c - i)/W, horiz = (id & 1) === 0;
+        const a0 = v[c], a1 = horiz ? v[c + 1] : v[c + W], t = (L - a0)/(a1 - a0);
+        q = llOf(-R + (i + (horiz ? t : 0))*sp, -R + (j + (horiz ? 0 : t))*sp); pos.set(id, q); return q;
+      };
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++){
+        const c = j*W + i, v00 = v[c], v10 = v[c+1], v11 = v[c+W+1], v01 = v[c+W];
+        if (v00 !== v00 || v10 !== v10 || v11 !== v11 || v01 !== v01) continue;    // NaN: no data
+        const k = (v00 >= L ? 1 : 0) | (v10 >= L ? 2 : 0) | (v11 >= L ? 4 : 0) | (v01 >= L ? 8 : 0);
+        if (k === 0 || k === 15) continue;
+        const E = { b:2*c, t:2*(c + W), l:2*c + 1, r:2*(c + 1) + 1 };
+        let pairs = CASES[k];
+        if (k === 5 || k === 10){                          // saddle: resolve with the cell-centre average
+          const inC = (v00 + v10 + v11 + v01)/4 >= L;
+          pairs = (k === 5) === inC ? [["b","r"],["t","l"]] : [["b","l"],["r","t"]];
+        }
+        for (const [x, y] of pairs){
+          const si = segs.push([E[x], E[y]]) - 1;
+          for (const id of [E[x], E[y]]){ const l = adj.get(id); if (l) l.push(si); else adj.set(id, [si]); }
+        }
+      }
+      // join segments into polylines
+      const used = new Uint8Array(segs.length);
+      for (let s0 = 0; s0 < segs.length; s0++){
+        if (used[s0]) continue; used[s0] = 1;
+        const chain = [segs[s0][0], segs[s0][1]];
+        for (const dir of [1, 0]){
+          for (;;){
+            const endId = dir ? chain[chain.length - 1] : chain[0];
+            const nx = (adj.get(endId) || []).find(si => !used[si]);
+            if (nx === undefined) break;
+            used[nx] = 1;
+            const other = segs[nx][0] === endId ? segs[nx][1] : segs[nx][0];
+            if (dir) chain.push(other); else chain.unshift(other);
+          }
+        }
+        if (chain.length > 2 || major) lines.push({ level:L, major, pts:chain.map(id => { const q = pt(id); return { lat:q.lat, lon:q.lon, g:L }; }) });
+      }
+    }
+    if (li < levels.length){ setTimeout(batch, 0); return; }
+    TOPO.lines = lines; TOPO.origin = obs; TOPO.interval = iv; TOPO.key = key; TOPO.building = false; TOPO.range = R;
+    applyVisibility(); updateChips();
+  })();
+}
+
+/* ---------- overlay housekeeping: streets, contours, horizon ---------- */
+function overlayTick(){
+  if (!S.pos) return;
+  const streetsOn = $("arOn").checked, topoOn = $("topoOn").checked;
+  if (streetsOn){
+    const need = !AR.origin || distBear(AR.origin, S.pos)[0] > +$("arRad").value*0.25;
+    if (need && !AR.loading && Date.now() >= (AR.retryAt || 0)) loadStreets();
+  }
+  if (topoOn){
+    const key = $("topoRange").value + "|" + $("topoInt").value;
+    if (!TOPO.building && (!TOPO.origin || TOPO.key !== key || distBear(TOPO.origin, S.pos)[0] > +$("topoRange").value*0.2)) buildContours();
+  }
+  if (!streetsOn && !topoOn) return;
+  const h0 = observerHeight(); if (h0 === null || HZ.building) return;
+  const Rneed = Math.min(6000, Math.max(streetsOn ? +$("arRad").value : 0, topoOn ? +$("topoRange").value : 0) + 300);
+  const H = HZ.ready, k = +$("refr").value || 0;
+  if (!H || H.R < Rneed || distBear(H.obs, S.pos)[0] > 30 || Math.abs(h0 - H.h0) > 2 || H.k !== k || (H.missing && dem.loaded > H.demLoaded))
+    buildHorizon(S.pos.slice(), h0, k, Rneed);
+}
+function maybeReloadStreets(){ overlayTick(); }
+["eye", "hSource", "gpsMaxErr", "gpsOff", "refr"].forEach(id => $(id).addEventListener("change", overlayTick));
+["topoOn", "topoInt", "topoRange"].forEach(id => $(id).addEventListener("change", () => { TOPO.origin = null; if (!$("topoOn").checked) TOPO.lines = []; overlayTick(); updateChips(); }));
+setInterval(overlayTick, 2000);
+
 function viewAxes(){
   if ($("sim").checked){
     const az = +$("simAz").value*D2R, el = +$("simEl").value*D2R;
@@ -795,12 +927,14 @@ function viewAxes(){
   return { X:S.axes[0], Y:S.axes[1], Z:S.axes[2], rot:(+$("decl").value || 0) + S.cal.az };
 }
 const arCv = $("ar"), arCx = arCv.getContext("2d");
+const TOPO_COLOR = "#f0a35e";
 function drawAR(){
   requestAnimationFrame(drawAR);
   const W = arCv.clientWidth, H = arCv.clientHeight, dpr = devicePixelRatio || 1;
   if (arCv.width !== Math.round(W*dpr) || arCv.height !== Math.round(H*dpr)){ arCv.width = Math.round(W*dpr); arCv.height = Math.round(H*dpr); }
   arCx.setTransform(dpr, 0, 0, dpr, 0, 0); arCx.clearRect(0, 0, W, H);
-  if (!$("arOn").checked || !AR.ways.length) return;
+  const showStreets = $("arOn").checked && AR.ways.length > 0, showTopo = $("topoOn").checked && TOPO.lines.length > 0;
+  if (!showStreets && !showTopo) return;
   const A = viewAxes(); if (!A || !S.pos) return;
   const h0 = observerHeight(); if (h0 === null) return;
   const curv = (1 - (+$("refr").value || 0))/(2*RE), lat0 = S.pos[0], lon0 = S.pos[1], cosL = Math.cos(lat0*D2R);
@@ -823,41 +957,84 @@ function drawAR(){
     const x = p[0]/p[2], y = p[1]/p[2];
     return [W/2 + f*(x*ct + y*st), H/2 - f*(-x*st + y*ct) + elShift];
   };
-  const showHidden = $("arHidden").checked, labels = new Map();
+  const near = 2;
+  /* project one segment; returns null when it's behind the camera. clippedEnd: b was pulled to the near plane */
+  const seg = (a, b) => {
+    let pa = toCam(worldOf(a)), pb = toCam(worldOf(b)), cutA = false, cutB = false;
+    if (pa[2] < near && pb[2] < near) return null;
+    if (pa[2] < near){ const t = (near - pa[2])/(pb[2] - pa[2]); pa = pa.map((x, k) => x + t*(pb[k] - x)); cutA = true; }
+    if (pb[2] < near){ const t = (near - pb[2])/(pa[2] - pb[2]); pb = pb.map((x, k) => x + t*(pa[k] - x)); cutB = true; }
+    return { sa:toScr(pa), sb:toScr(pb), da:pa[2], cutA, cutB };
+  };
   arCx.lineCap = "round"; arCx.lineJoin = "round";
-  for (const pass of [0, 1]){                 // hidden streets first, visible on top
-    for (const w of AR.ways){
-      const st_ = ROAD_STYLE[w.cls];
-      arCx.lineWidth = pass ? st_.w : Math.max(1, st_.w*0.6);
-      arCx.strokeStyle = st_.c; arCx.globalAlpha = pass ? 0.95 : 0.28;
-      arCx.setLineDash(pass ? (st_.dash || []) : [3,6]);
-      if (!pass && !showHidden) continue;
-      arCx.beginPath(); let pen = false;
-      for (let i = 0; i < w.pts.length - 1; i++){
-        const a = w.pts[i], b = w.pts[i+1];
-        if (a.g === undefined || b.g === undefined || a.vis === undefined || b.vis === undefined) { pen = false; continue; }
-        if ((a.vis && b.vis) !== !!pass){ pen = false; continue; }
-        let pa = toCam(worldOf(a)), pb = toCam(worldOf(b));
-        const near = 2;
-        if (pa[2] < near && pb[2] < near){ pen = false; continue; }
-        if (pa[2] < near){ const t = (near - pa[2])/(pb[2] - pa[2]); pa = pa.map((x, k) => x + t*(pb[k] - x)); pen = false; }
-        if (pb[2] < near){ const t = (near - pb[2])/(pa[2] - pb[2]); pb = pb.map((x, k) => x + t*(pa[k] - x)); }
-        const sa = toScr(pa), sb = toScr(pb);
-        if (!w.labelOnly){
-          if (!pen){ arCx.moveTo(sa[0], sa[1]); pen = true; }
-          arCx.lineTo(sb[0], sb[1]);
+
+  // contours first, so streets sit on top; occluded parts are never drawn
+  const topoLabels = [];
+  if (showTopo){
+    arCx.strokeStyle = TOPO_COLOR; arCx.setLineDash([]);
+    for (const major of [false, true]){
+      arCx.lineWidth = major ? 2 : 1; arCx.globalAlpha = major ? 0.9 : 0.55;
+      arCx.beginPath();
+      for (const Ln of TOPO.lines){
+        if (Ln.major !== major) continue;
+        let pen = false, best = null;
+        for (let i = 0; i < Ln.pts.length - 1; i++){
+          const a = Ln.pts[i], b = Ln.pts[i+1];
+          if (!a.vis || !b.vis){ pen = false; continue; }
+          const r = seg(a, b); if (!r){ pen = false; continue; }
+          if (!pen || r.cutA){ arCx.moveTo(r.sa[0], r.sa[1]); }
+          arCx.lineTo(r.sb[0], r.sb[1]); pen = !r.cutB;
+          if (major && r.sa[0] > 30 && r.sa[0] < W - 30 && r.sa[1] > 50 && r.sa[1] < H - 50){
+            const dc = Math.hypot(r.sa[0] - W/2, r.sa[1] - H/2);
+            if (!best || dc < best.dc) best = { x:r.sa[0], y:r.sa[1], dc, level:Ln.level };
+          }
         }
-        if (pb[2] < near + 1e-6) pen = false;
-        if (pass && w.name && sa[0] > 20 && sa[0] < W - 20 && sa[1] > 40 && sa[1] < H - 40){
-          const dc = Math.hypot(sa[0] - W/2, sa[1] - H/2), prev = labels.get(w.name);
-          if (!prev || dc < prev.dc) labels.set(w.name, { x:sa[0], y:sa[1], dc, d:pa[2] });
-        }
+        if (best) topoLabels.push(best);
       }
       arCx.stroke();
     }
   }
+
+  const labels = new Map();
+  if (showStreets){
+    const showHidden = $("arHidden").checked;
+    for (const pass of [0, 1]){                 // hidden streets first (only if enabled), visible on top
+      if (!pass && !showHidden) continue;
+      for (const w of AR.ways){
+        if (w.labelOnly && !pass) continue;
+        const st_ = ROAD_STYLE[w.cls];
+        arCx.lineWidth = pass ? st_.w : Math.max(1, st_.w*0.6);
+        arCx.strokeStyle = st_.c; arCx.globalAlpha = pass ? 0.95 : 0.28;
+        arCx.setLineDash(pass ? (st_.dash || []) : [3,6]);
+        arCx.beginPath(); let pen = false;
+        for (let i = 0; i < w.pts.length - 1; i++){
+          const a = w.pts[i], b = w.pts[i+1];
+          if (a.g == null || b.g == null || a.vis === undefined || b.vis === undefined){ pen = false; continue; }
+          if ((a.vis && b.vis) !== !!pass){ pen = false; continue; }
+          const r = seg(a, b); if (!r){ pen = false; continue; }
+          if (!w.labelOnly){
+            if (!pen || r.cutA) arCx.moveTo(r.sa[0], r.sa[1]);
+            arCx.lineTo(r.sb[0], r.sb[1]); pen = !r.cutB;
+          }
+          if (pass && w.name && r.sa[0] > 20 && r.sa[0] < W - 20 && r.sa[1] > 40 && r.sa[1] < H - 40){
+            const dc = Math.hypot(r.sa[0] - W/2, r.sa[1] - H/2), prev = labels.get(w.name);
+            if (!prev || dc < prev.dc) labels.set(w.name, { x:r.sa[0], y:r.sa[1], dc, d:r.da });
+          }
+        }
+        arCx.stroke();
+      }
+    }
+  }
+
   arCx.globalAlpha = 1; arCx.setLineDash([]);
-  arCx.font = "600 12px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+  const mono = getComputedStyle(document.documentElement).getPropertyValue("--mono");
+  arCx.font = "600 11px " + mono;
+  topoLabels.sort((a, b) => a.dc - b.dc).slice(0, 5).forEach(p => {
+    const t = `${p.level} m`, tw = arCx.measureText(t).width;
+    arCx.fillStyle = "rgba(15,21,23,.7)"; arCx.fillRect(p.x - tw/2 - 3, p.y - 7, tw + 6, 14);
+    arCx.fillStyle = TOPO_COLOR; arCx.fillText(t, p.x - tw/2, p.y + 4);
+  });
+  arCx.font = "600 12px " + mono;
   [...labels.entries()].sort((a, b) => a[1].dc - b[1].dc).slice(0, 10).forEach(([name, p]) => {
     const t = `${name} · ${fmtKm(p.d)}`, tw = arCx.measureText(t).width;
     arCx.fillStyle = "rgba(15,21,23,.78)"; arCx.fillRect(p.x - tw/2 - 4, p.y - 18, tw + 8, 16);
@@ -865,18 +1042,6 @@ function drawAR(){
   });
 }
 requestAnimationFrame(drawAR);
-function maybeReloadStreets(){
-  if (!$("arOn").checked || !S.pos) return;
-  const need = !AR.origin || distBear(AR.origin, S.pos)[0] > +$("arRad").value*0.25;
-  if (need && !AR.loading && Date.now() >= (AR.retryAt || 0)) loadStreets();
-  else if (!AR.loading && AR.visOrigin){
-    const h0 = observerHeight();
-    if (distBear(AR.visOrigin, S.pos)[0] > 30 || (h0 !== null && Math.abs(h0 - AR.visH0) > 2) || (+$("refr").value || 0) !== AR.visK)
-      computeVisibility();
-  }
-}
-["eye", "hSource", "gpsMaxErr", "gpsOff", "refr"].forEach(id => $(id).addEventListener("change", maybeReloadStreets));
-setInterval(maybeReloadStreets, 3000);
 
 /* ---------- UI ---------- */
 /* status: one dot, green = all working, yellow = something in progress or degraded, red = something failed */
@@ -923,6 +1088,21 @@ function statusItems(){
     else if (AR.status === "stale") it.push(["Streets", "busy", `${drawn} roads (old area) · retry ${wait}s`]);
     else if (AR.status === "ok") it.push(["Streets", "ok", `${drawn} roads · ${AR.source}`]);
     else it.push(["Streets", "busy", "Starting"]);
+  }
+  // contours
+  if ($("topoOn").checked){
+    if (!S.pos) it.push(["Contours", "off", "Waiting for location"]);
+    else if (TOPO.building) it.push(["Contours", "busy", "Tracing contours"]);
+    else if (TOPO.lines.length) it.push(["Contours", "ok", `${TOPO.lines.length} lines · ${TOPO.interval} m · ${TOPO.range/1000} km`]);
+    else if (TOPO.origin) it.push(["Contours", "busy", "No contours in range (flat or no data)"]);
+    else it.push(["Contours", "busy", "Starting"]);
+  }
+  // occlusion
+  if (($("arOn").checked || $("topoOn").checked) && S.pos){
+    const Hz = HZ.ready;
+    if (HZ.building && !Hz) it.push(["Occlusion", "busy", "Computing horizon"]);
+    else if (Hz) it.push(["Occlusion", HZ.building || Hz.missing ? "busy" : "ok", `${Hz.NA} bearings · ${(Hz.R/1000).toFixed(1)} km` + (HZ.building ? " · updating" : "") + (Hz.missing ? " · some terrain missing" : "")]);
+    else it.push(["Occlusion", "busy", "Waiting for height"]);
   }
   return it;
 }
@@ -1031,6 +1211,9 @@ function snapshot(){
     dem:{ z:dem.z, tilesLoaded:dem.loaded, tilesRequested:dem.tiles.size, errors:dem.errors }, status:statusItems(), gpsErr:S.gpsErr, camErr:S.camErr,
     ar:{ on:$("arOn").checked, status:AR.status, source:AR.source, sourceErrs:AR.sourceErrs, server:AR.server, fails:AR.fails, lastErr:AR.lastErr, serverErrs:AR.serverErrs,
       retryInS:AR.retryAt ? Math.round((AR.retryAt - Date.now())/1000) : null, ways:AR.ways.length, origin:AR.origin, visOrigin:AR.visOrigin, visH0:r3(AR.visH0) },
+    topo:{ on:$("topoOn").checked, lines:TOPO.lines.length, interval:TOPO.interval, range:TOPO.range, origin:TOPO.origin, building:TOPO.building,
+      vertices:TOPO.lines.reduce((n, l) => n + l.pts.length, 0) },
+    horizon:HZ.ready && { obs:HZ.ready.obs, h0:r3(HZ.ready.h0), R:HZ.ready.R, NA:HZ.ready.NA, ND:HZ.ready.ND, missing:HZ.ready.missing, ageS:Math.round((Date.now() - HZ.ready.at)/1000) },
     lastFix:f && { az:r3(f.az), el:r3(f.el), h0:r3(f.h0), obs:f.obs, missing:f.missing,
       hit:f.hit && { lat:r3(f.hit.lat*100)/100, lon:r3(f.hit.lon*100)/100, d:r3(f.hit.d), elev:r3(f.hit.elev) },
       sky:f.sky && { d:r3(f.sky.d), ang:r3(f.sky.ang), elev:r3(f.sky.elev) } },
@@ -1049,7 +1232,7 @@ $("btnDbgCopy").onclick = () => {
 };
 
 /* persist settings in this browser */
-const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","layer"];
+const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","topoOn","topoInt","topoRange","layer"];
 let saved = {};
 const STORE = { raw:null, readErr:null, writeErr:null, writes:0, restored:[], mismatched:[] };
 try { STORE.raw = localStorage.getItem("sightline.settings"); saved = JSON.parse(STORE.raw) || {}; } catch(e){ STORE.readErr = String(e); }

@@ -308,20 +308,44 @@ function rotYaw(ax, deg){
   const d = deg*D2R, c = Math.cos(d), s = Math.sin(d);
   return ax.map(([x, y, z]) => [x*c + y*s, y*c - x*s, z]);
 }
+/* Chrome's gyro-only stream on Android restarts its yaw reference now and then (seen in captures: the gap between
+   compass and gyro heading stayed within 0.1 deg for seconds, then jumped tens of degrees). A magnet bends the compass
+   gradually as you turn or move; a gyro reset is a sudden step that then holds. So: watch the instantaneous gap, and
+   when it steps by more than 3 deg in one update and holds within 1.5 deg for 0.6 s, shift the offset by the step.
+   The shift also applies when north is locked, so a landmark or skyline lock survives the reset. */
 function fuse(rawAx, compassAz){
-  if (compassAz != null && !S.northLocked){
-    const diff = wrap180(compassAz - refAz(rawAx));
-    const now = performance.now();
-    if (S.northOff == null) S.northOff = diff;
-    else S.northOff += Math.min(1, (now - (S.fuseT || now))/15000)*wrap180(diff - S.northOff);   // ~15 s time constant
+  const now = performance.now();
+  if (compassAz != null){
+    const inst = wrap180(compassAz - refAz(rawAx)), J = S.jump || (S.jump = { base:null, lastT:0, cand:null });
+    if (J.base === null || now - J.lastT > 1000){ J.base = inst; J.cand = null; }      // (re)start after a gap
+    else if (!J.cand){
+      if (Math.abs(wrap180(inst - J.base)) > 3) J.cand = { to:inst, t:now, n:0 };       // step away from the steady gap
+      else J.base = wrap180(J.base + 0.2*wrap180(inst - J.base));
+    } else {
+      if (Math.abs(wrap180(inst - J.cand.to)) <= 1.5){ J.cand.n++; J.cand.to = wrap180(J.cand.to + 0.2*wrap180(inst - J.cand.to)); }
+      else if (Math.abs(wrap180(inst - J.base)) <= 1.5) J.cand = null;                  // back to the old gap: a glitch
+      else J.cand = { to:inst, t:now, n:0 };                                            // still moving: restart the hold
+      if (J.cand && now - J.cand.t >= 600 && J.cand.n >= 5){
+        const shift = wrap180(J.cand.to - J.base);
+        if (S.northOff != null) S.northOff = wrap180(S.northOff + shift);
+        dbgPush(DBG.resets, { t:Math.round(now), shift:r3(shift), locked:!!S.northLocked });
+        S.resetCount = (S.resetCount || 0) + 1; J.base = J.cand.to; J.cand = null;
+      }
+    }
+    J.lastT = now;
+    if (!S.northLocked && !(J.cand)){
+      if (S.northOff == null) S.northOff = inst;
+      else S.northOff += Math.min(1, (now - (S.fuseT || now))/15000)*wrap180(inst - S.northOff);   // ~15 s time constant
+    }
     S.fuseT = now;
+    if (now - (S.offLogT || 0) > 1000){ S.offLogT = now; dbgPush(DBG.offset, { t:Math.round(now), inst:r3(inst), filt:r3(S.northOff), locked:!!S.northLocked }); }
   }
   return S.northOff == null ? null : rotYaw(rawAx, S.northOff);
 }
 /* ---------- debug ring buffers ---------- */
-const DBG = { orient:[], abs:[], gps:[], errors:[], counts:{ orient:0, abs:0, gps:0 } };
+const DBG = { orient:[], abs:[], gps:[], errors:[], resets:[], offset:[], counts:{ orient:0, abs:0, gps:0 } };
 const r3 = v => (typeof v === "number" && isFinite(v)) ? Math.round(v*1000)/1000 : v;
-function dbgPush(buf, rec){ buf.push(rec); if (buf.length > 150) buf.shift(); }
+function dbgPush(buf, rec){ buf.push(rec); if (buf.length > (buf === DBG.offset ? 900 : 150)) buf.shift(); }
 function dbgOrient(name, e){
   DBG.counts[name]++;
   dbgPush(DBG[name], { t:Math.round(performance.now()), a:r3(e.alpha), b:r3(e.beta), g:r3(e.gamma), abs:e.absolute,
@@ -352,7 +376,7 @@ function onOrient(e){
     if (!ax){ S.kind = "waiting for compass"; updateChips(); return; }
   }
   if (!ax) return;
-  applyAxes(ax, kind + (S.northLocked ? " · gyro, north locked" : " · gyro + compass"));
+  applyAxes(ax, kind + (S.northLocked ? " · gyro, north locked" : " · gyro + compass") + (S.resetCount ? ` · ${S.resetCount} gyro reset${S.resetCount > 1 ? "s" : ""} caught` : ""));
 }
 function applyAxes(ax, kind){
   S.kind = kind;
@@ -405,7 +429,7 @@ async function startCam(){
   if (camStarting) return; camStarting = true;
   try {
     S.camErr = null; updateChips();
-    camStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:"environment" } }, audio:false });
+    camStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:"environment" }, width:{ ideal:1920 }, height:{ ideal:1440 } }, audio:false });
     camStream.getVideoTracks().forEach(t => t.addEventListener("ended", () => { if (!document.hidden) restartCam(); }));
     $("cam").srcObject = camStream; $("cam").hidden = false; await $("cam").play();
     await applyFocus();
@@ -434,7 +458,7 @@ async function applyFocus(){
     } else if (modes.includes("continuous") && await tryC({ focusMode:"continuous" })) did = "continuous (no manual focus)";
   }
   const st = t.getSettings ? t.getSettings() : {};
-  S.camFocus = { requested:mode, applied:did, modes, focusDistance:caps.focusDistance || null, pointsOfInterest:"pointsOfInterest" in caps,
+  S.camFocus = { resolution:`${st.width}x${st.height}`, requested:mode, applied:did, modes, focusDistance:caps.focusDistance || null, pointsOfInterest:"pointsOfInterest" in caps,
     settings:{ focusMode:st.focusMode, focusDistance:st.focusDistance, pointsOfInterest:st.pointsOfInterest, width:st.width, height:st.height, zoom:st.zoom } };
   $("focusInfo").textContent = modes.length ? did : "not exposed by this phone";
 }
@@ -1440,7 +1464,9 @@ function skyFit(img, H, A, base){
   else if (coverage < 0.4) why = `edge found along only ${Math.round(coverage*100)}% of the skyline`;
   else if (relief < 0.12) why = "skyline too flat to fix heading";
   else if (margin < 0.08) why = "several headings fit equally well";
-  const partial = !!why && n >= 25 && coverage >= 0.4;          // heading unknown, but pitch and roll still fixed
+  // heading unknown but pitch and roll still fixed: only for a genuinely flat skyline (sea, plain), never for an
+  // ambiguous one, where the pitch found is as unreliable as the heading (seen on town frames: fences, roofs)
+  const partial = why === "skyline too flat to fix heading" && n >= 25 && coverage >= 0.6 && rms !== null && rms < 1;
   return out({ ok:!why, partial, why, daz:q.at(0), del:q.at(1), droll:q.at(2), dz:q.at(3), sd, margin, relief, n, n0, coverage, rmsPx:rms, score:s2,
     pts:meas.map(m => [Math.round(m.x*10)/10, Math.round(m.ym*10)/10]), pred:P });
 }
@@ -1703,6 +1729,7 @@ function snapshot(full){
       sky:f.sky && { d:r3(f.sky.d), ang:r3(f.sky.ang), elev:r3(f.sky.elev) } },
     skyline:{ on:skyOn(), filter:{ ...SKY.f }, last:SKY.last && { ok:SKY.last.ok, why:SKY.last.why, daz:SKY.last.daz, del:SKY.last.del, droll:SKY.last.droll, dz:SKY.last.dz, sd:SKY.last.sd, margin:SKY.last.margin, relief:SKY.last.relief, n:SKY.last.n, n0:SKY.last.n0, ms:SKY.last.ms, used:SKY.last.used }, farHorizon:SKY.H && { obs:SKY.H.obs, at:SKY.H.at, missing:SKY.H.missing } },
     locked:S.locked, settings, storage:{ ...STORE, savedNow:saved, origin:location.origin, path:location.pathname }, counts:DBG.counts,
+    gyroResets:DBG.resets.slice(), offsetLog:full ? DBG.offset.slice() : DBG.offset.slice(-30),
     raw:full ? { orientation:DBG.orient.slice(), orientationAbsolute:DBG.abs.slice(), gps:DBG.gps.slice() }
              : { orientation:DBG.orient.slice(-20), orientationAbsolute:DBG.abs.slice(-20), gps:DBG.gps.slice(-20) }, errors:DBG.errors,
   };

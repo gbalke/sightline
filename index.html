@@ -325,6 +325,7 @@ function fuse(rawAx, compassAz){
       if (Math.abs(wrap180(inst - J.cand.to)) <= 1.5){ J.cand.n++; J.cand.to = wrap180(J.cand.to + 0.2*wrap180(inst - J.cand.to)); }
       else if (Math.abs(wrap180(inst - J.base)) <= 1.5) J.cand = null;                  // back to the old gap: a glitch
       else J.cand = { to:inst, t:now, n:0 };                                            // still moving: restart the hold
+      if (J.cand && now - J.cand.t >= 600 && J.cand.n >= 5 && Math.abs(wrap180(J.cand.to - J.base)) <= 3){ J.base = J.cand.to; J.cand = null; }
       if (J.cand && now - J.cand.t >= 600 && J.cand.n >= 5){
         const shift = wrap180(J.cand.to - J.base);
         if (S.northOff != null) S.northOff = wrap180(S.northOff + shift);
@@ -333,12 +334,23 @@ function fuse(rawAx, compassAz){
       }
     }
     J.lastT = now;
+    /* How fast to follow the compass: Android's compass heading settles slowly after start-up (seen in captures as
+       a steady ramp of ~14 deg/s for ~7 s, then flat). Follow quickly (2 s) once the gap has been steady for 3 s;
+       slowly (15 s) while it is moving, which is also when a magnet is bending it. */
+    const win = S.offWin || (S.offWin = []);
+    win.push({ t:now, v:inst }); while (win.length && now - win[0].t > 3000) win.shift();
+    let steady = false;
+    if (win.length > 10 && now - win[0].t > 2500){
+      let cx = 0, sy = 0; for (const w of win){ cx += Math.cos(w.v*D2R); sy += Math.sin(w.v*D2R); }
+      const mean = Math.atan2(sy, cx)*R2D; steady = win.every(w => Math.abs(wrap180(w.v - mean)) < 1.5);
+    }
+    S.offSteady = steady;
     if (!S.northLocked && !(J.cand)){
       if (S.northOff == null) S.northOff = inst;
-      else S.northOff += Math.min(1, (now - (S.fuseT || now))/15000)*wrap180(inst - S.northOff);   // ~15 s time constant
+      else S.northOff += Math.min(1, (now - (S.fuseT || now))/(steady ? 2000 : 15000))*wrap180(inst - S.northOff);
     }
     S.fuseT = now;
-    if (now - (S.offLogT || 0) > 1000){ S.offLogT = now; dbgPush(DBG.offset, { t:Math.round(now), inst:r3(inst), filt:r3(S.northOff), locked:!!S.northLocked }); }
+    if (now - (S.offLogT || 0) > 1000){ S.offLogT = now; dbgPush(DBG.offset, { t:Math.round(now), inst:r3(inst), filt:r3(S.northOff), locked:!!S.northLocked, steady:S.offSteady }); }
   }
   return S.northOff == null ? null : rotYaw(rawAx, S.northOff);
 }
@@ -1144,7 +1156,11 @@ function statusItems(){
   // heading
   if (sim) it.push(["Heading", "ok", "Simulated sliders"]);
   else if (!started) it.push(["Heading", "off", "Press Start"]);
-  else if (S.vec) it.push(["Heading", /compass only|waiting/.test(S.kind) ? "busy" : "ok", S.kind]);
+  else if (S.vec){
+    const J = S.jump, gap = J && J.base != null && S.northOff != null ? Math.abs(wrap180(J.base - S.northOff)) : 0;
+    if (!S.northLocked && !S.offSteady && gap > 5) it.push(["Heading", "busy", `Compass settling, ${gap.toFixed(0)}° to go · hold still a few seconds`]);
+    else it.push(["Heading", /compass only|waiting/.test(S.kind) ? "busy" : "ok", S.kind]);
+  }
   else if (since > 4) it.push(["Heading", "bad", "No motion sensor data"]);
   else it.push(["Heading", "busy", S.kind === "waiting for compass" ? "Waiting for compass" : "Starting sensors"]);
   // elevation

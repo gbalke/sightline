@@ -52,6 +52,7 @@ body{background:var(--bg);color:var(--fg);font:15px/1.35 var(--sans);display:fle
 #banner span{flex:1 1 auto;min-width:0}
 #banner button{flex:none;padding:6px 10px;font-size:12px}
 nav{display:flex;gap:6px;padding:8px max(10px,env(safe-area-inset-right,0px)) 8px max(10px,env(safe-area-inset-left,0px));border-top:1px solid var(--line);background:var(--panel)}
+nav button{font-size:13px;letter-spacing:.02em;padding-inline:6px;flex:1 1 auto}
 button{font:600 14px var(--sans);letter-spacing:.04em;text-transform:uppercase;color:var(--fg);background:#22302f;border:1px solid var(--line);border-radius:4px;padding:11px 8px;flex:1 1 0;min-width:0;cursor:pointer}
 button.primary{background:var(--reticle);color:#1a1606;border-color:var(--reticle)}
 button.on{border-color:var(--reticle);color:var(--reticle)}
@@ -103,6 +104,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <button id="btnStart" class="primary">Start</button>
   <button id="btnLock">Lock</button>
   <button id="btnCal">Calibrate</button>
+  <button id="btnCap">Capture</button>
   <button id="btnMore">More</button>
 </nav>
 
@@ -148,8 +150,13 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div class="row"><label for="sim">Simulate mode — tap map to place yourself</label><input id="sim" type="checkbox"></div>
   <div class="row"><label for="simAz">Az</label><input id="simAz" type="range" min="0" max="359.9" step="0.1" value="0"><span id="simAzV" class="mono">0.0°</span></div>
   <div class="row"><label for="simEl">El</label><input id="simEl" type="range" min="-30" max="15" step="0.05" value="-2"><span id="simElV" class="mono">-2.00°</span></div>
+  <h2>Captures</h2>
+  <p class="note">Capture saves the camera frame with every raw sensor reading, the pose estimate and the terrain horizon out to 25 km, on this phone only. For a labelled frame, tap Calibrate, tap a landmark on the map, aim the crosshair at it, then press Capture. Export bundles everything into one zip to attach in a chat.</p>
+  <div class="row"><span>Saved on this phone</span><span id="capCount" class="mono">0</span></div>
+  <div class="row"><label for="capNote">Note for next captures</label><input id="capNote" type="text" placeholder="e.g. ridge north of hut" style="flex:1;min-width:0;font:13px var(--mono);background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:6px"></div>
+  <div class="row"><button id="btnCapExport" class="primary">Export zip</button><button id="btnCapClear">Delete all</button></div>
   <h2>Debug</h2>
-  <p class="note">Captures the last 20 raw readings from each sensor stream plus GPS, heading state, settings and the last fix. Copy it and paste it into a chat.</p>
+  <p class="note">Shows the last 20 raw readings from each sensor stream plus GPS, heading state, settings and the last fix. Copy it and paste it into a chat.</p>
   <div class="row"><button id="btnDbgCopy" class="primary">Copy snapshot</button><button id="btnDbgShow">Show</button></div>
   <textarea id="dbgOut" readonly hidden spellcheck="false" style="width:100%;height:220px;font:11px/1.35 var(--mono);background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:6px;margin-top:6px"></textarea>
   <div class="row"><button id="btnClose" class="primary">Close</button></div>
@@ -302,7 +309,7 @@ function fuse(rawAx, compassAz){
 /* ---------- debug ring buffers ---------- */
 const DBG = { orient:[], abs:[], gps:[], errors:[], counts:{ orient:0, abs:0, gps:0 } };
 const r3 = v => (typeof v === "number" && isFinite(v)) ? Math.round(v*1000)/1000 : v;
-function dbgPush(buf, rec){ buf.push(rec); if (buf.length > 20) buf.shift(); }
+function dbgPush(buf, rec){ buf.push(rec); if (buf.length > 150) buf.shift(); }
 function dbgOrient(name, e){
   DBG.counts[name]++;
   dbgPush(DBG[name], { t:Math.round(performance.now()), a:r3(e.alpha), b:r3(e.beta), g:r3(e.gamma), abs:e.absolute,
@@ -443,7 +450,7 @@ map.on("click", e => {
   if (S.calMode === 1){
     S.calTarget = ll; gCal.setLatLng(ll).addTo(map); S.calMode = 2;
     loadTile(dem.z, ...tileXY(ll[0], ll[1], dem.z).map(Math.floor));
-    banner("Aim the crosshair at that landmark, hold steady, then press Set.", true);
+    banner("Aim the crosshair at that landmark, hold steady, then press Set to calibrate, or Capture to save a labelled frame.", true);
     return;
   }
   if ($("sim").checked){ S.acc = 5; setObserver(ll); }
@@ -1141,6 +1148,7 @@ $("bannerSet").onclick = () => {
   const [d, brg] = distBear(S.pos, S.calTarget), k = +$("refr").value || 0;
   const trueEl = Math.atan2(T - h0 - (1 - k)*d*d/(2*RE), d)*R2D;
   S.cal = { az:((brg - m.az + 540) % 360) - 180, el:trueEl - m.el };
+  S.calInfo = { at:new Date().toISOString(), target:S.calTarget.slice(), distM:Math.round(d), bearing:r3(brg), trueEl:r3(trueEl), measured:{ az:r3(m.az), el:r3(m.el) } };
   try { localStorage.setItem("sightline.cal", JSON.stringify(S.cal)); } catch(e){}
   if ($("lockNorth").checked && !$("sim").checked) S.northLocked = true;
   S.calMode = 0; gCal.remove();
@@ -1184,6 +1192,166 @@ $("btnZeroGps").onclick = () => {
   toast(`GPS offset set to ${$("gpsOff").value} m.`);
 };
 
+/* ---------- captures: frame + raw sensors + pose + long-range horizon, kept in IndexedDB ---------- */
+const CAP = { db:null, count:0, busy:false, hz:null, prepared:null };
+function capDB(){
+  if (CAP.db) return Promise.resolve(CAP.db);
+  return new Promise((res, rej) => {
+    const rq = indexedDB.open("sightline-captures", 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore("captures", { keyPath:"id" });
+    rq.onsuccess = () => { CAP.db = rq.result; res(CAP.db); };
+    rq.onerror = () => rej(rq.error);
+  });
+}
+async function capTx(mode, fn){
+  const db = await capDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("captures", mode), st = tx.objectStore("captures"); let out;
+    const r = fn(st); if (r) r.onsuccess = () => { out = r.result; };
+    tx.oncomplete = () => res(out); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error);
+  });
+}
+async function capRefreshCount(){
+  try { CAP.count = await capTx("readonly", st => st.count()) || 0; } catch(e){ CAP.count = 0; }
+  $("capCount").textContent = String(CAP.count);
+}
+/* Terrain horizon to 25 km: for each of 1440 bearings (0.25 deg, true north), the highest elevation angle,
+   the distance of the ridge that forms it and its terrain height. Angle includes curvature and refraction for h0. */
+async function captureHorizon(obs, h0, k){
+  const R = 25000;
+  if (CAP.hz && distBear(CAP.hz.obs, obs)[0] < 20 && Math.abs(CAP.hz.h0 - h0) < 1 && CAP.hz.k === k && !CAP.hz.missing) return CAP.hz;
+  await preload(obs[0], obs[1], R + 500);
+  const NA = 1440, ds = hzDistances(R), curv = (1 - k)/(2*RE), cosL = Math.cos(obs[0]*D2R);
+  const ang = new Array(NA), dist = new Array(NA), elev = new Array(NA); let missing = 0;
+  for (let a = 0; a < NA; a++){
+    const az = a*2*Math.PI/NA, se = Math.sin(az), cn = Math.cos(az); let best = -Infinity, bd = null, bt = null;
+    for (const d of ds){
+      const T = elevAt(obs[0] + d*cn/RE*R2D, obs[1] + d*se/(RE*cosL)*R2D);
+      if (T === null){ missing++; continue; }
+      const sl = (T - h0 - curv*d*d)/d; if (sl > best){ best = sl; bd = d; bt = T; }
+    }
+    ang[a] = bd === null ? null : Math.round(Math.atan(best)*R2D*1000)/1000; dist[a] = bd === null ? null : Math.round(bd); elev[a] = bt === null ? null : Math.round(bt*10)/10;
+    if (a % 120 === 119) await new Promise(r => setTimeout(r, 0));
+  }
+  CAP.hz = { obs:obs.slice(), h0:r3(h0), k, R, NA, stepDeg:360/NA, ang, dist, elev, missing, at:new Date().toISOString() };
+  return CAP.hz;
+}
+function frameBlob(){
+  const v = $("cam");
+  if (v.hidden || !v.videoWidth) return Promise.resolve(null);
+  const s = Math.min(1, 1280/Math.max(v.videoWidth, v.videoHeight)), w = Math.round(v.videoWidth*s), h = Math.round(v.videoHeight*s);
+  const c = document.createElement("canvas"); c.width = w; c.height = h; c.getContext("2d").drawImage(v, 0, 0, w, h);
+  return new Promise(res => c.toBlob(b => res(b && { blob:b, w, h }), "image/jpeg", 0.9));
+}
+async function capture(){
+  if (CAP.busy) return; CAP.busy = true; $("btnCap").textContent = "Saving…";
+  try {
+    const t0 = performance.now(), at = new Date(), id = at.toISOString().replace(/[:.]/g, "-");
+    const frame = await frameBlob();                                   // grab the frame first, then everything else
+    const snap = snapshot(true), v = $("cam"), view = $("view").getBoundingClientRect();
+    const h0 = S.pos ? observerHeight() : null, k = +$("refr").value || 0;
+    let aim = null;
+    if (S.calMode === 2 && S.calTarget && S.pos){
+      const T = elevAt(S.calTarget[0], S.calTarget[1]), [d, brg] = distBear(S.pos, S.calTarget);
+      aim = { lat:S.calTarget[0], lon:S.calTarget[1], terrainM:T === null ? null : r3(T), distM:Math.round(d), bearingDeg:r3(brg),
+        elevAngleDeg:(T === null || h0 === null) ? null : r3(Math.atan2(T - h0 - (1 - k)*d*d/(2*RE), d)*R2D),
+        note:"crosshair was aimed at this point when captured" };
+    }
+    const meta = {
+      schema:1, id, at:at.toISOString(), note:$("capNote").value || "", tFrame:Math.round(t0),
+      camera:{ capturedW:frame && frame.w, capturedH:frame && frame.h, videoW:v.videoWidth || null, videoH:v.videoHeight || null,
+        viewW:Math.round(view.width), viewH:Math.round(view.height), fit:"cover", fovLongDeg:+$("fov").value || 66,
+        screenAngle:(screen.orientation && screen.orientation.angle) || window.orientation || 0, crosshair:"centre of the view" },
+      aim, calibration:S.calInfo || null, snapshot:snap,
+      horizon:(S.pos && h0 !== null) ? await captureHorizon(S.pos, h0, k) : null,
+    };
+    await capTx("readwrite", st => st.put({ id, at:meta.at, meta:JSON.stringify(meta), jpg:frame ? frame.blob : null }));
+    await capRefreshCount();
+    CAP.prepared = null; $("btnCapExport").textContent = "Export zip";
+    if (S.calMode === 2) banner(`Saved labelled frame ${CAP.count}. Aim again and press Capture for another, Set to calibrate, or ✕ to finish.`, true);
+    else toast(`Captured ${CAP.count}${aim ? " (labelled)" : ""}${frame ? "" : ", no camera frame"}${meta.horizon && meta.horizon.missing ? ", some terrain missing" : ""}.`);
+  } catch(e){ toast("Capture failed: " + (e.message || e)); }
+  CAP.busy = false; $("btnCap").textContent = "Capture";
+}
+/* minimal store-only zip writer (JPEGs are already compressed) */
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++){ let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8){ let c = 0xffffffff; for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+function makeZip(files){                                                // files: [{name, data:Uint8Array}]
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  const d = new Date(), dosT = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1), dosD = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  for (const f of files){
+    const nm = enc.encode(f.name), crc = crc32(f.data), h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+    h.setUint16(10, dosT, true); h.setUint16(12, dosD, true); h.setUint32(14, crc, true); h.setUint32(18, f.data.length, true);
+    h.setUint32(22, f.data.length, true); h.setUint16(26, nm.length, true); h.setUint16(28, 0, true);
+    parts.push(new Uint8Array(h.buffer), nm, f.data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true);
+    c.setUint16(12, dosT, true); c.setUint16(14, dosD, true); c.setUint32(16, crc, true); c.setUint32(20, f.data.length, true); c.setUint32(24, f.data.length, true);
+    c.setUint16(28, nm.length, true); c.setUint32(42, off, true);
+    central.push(new Uint8Array(c.buffer), nm);
+    off += 30 + nm.length + f.data.length;
+  }
+  const csize = central.reduce((n, a) => n + a.length, 0), e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, csize, true); e.setUint32(16, off, true);
+  return new Blob([...parts, ...central, new Uint8Array(e.buffer)], { type:"application/zip" });
+}
+const CAP_README = `Sightline captures (schema 1)
+
+One folder per capture: frame.jpg (camera frame, long side <= 1280 px) and meta.json.
+
+meta.json
+  camera     frame size, the on-screen view size, FOV setting (long side, degrees), screen angle.
+             The view shows the frame scaled to cover; the crosshair is the view centre.
+  aim        set when the crosshair was aimed at a map point: its position, true bearing and elevation
+             angle from the observer. Use as ground truth for heading and pitch of the crosshair ray.
+  calibration  the last landmark calibration (time, landmark, measured vs true angles), if any.
+  snapshot   the app's debug snapshot: pose estimate (axes = device X/Y/Z in east-north-up; the camera
+             looks along -Z), heading model state, GPS and GPS-altitude estimate, settings, and
+             raw.orientation / raw.orientationAbsolute / raw.gps: up to the last 150 raw readings each
+             (t = ms since page load, comparable to tFrame).
+  horizon    terrain skyline to 25 km from the observer at height h0 (m): for bearing i * stepDeg
+             (true north, clockwise), ang = highest elevation angle (deg, with earth curvature and
+             refraction k), dist = distance of the ridge forming it (m), elev = its terrain height (m).
+             missing > 0 means some elevation tiles were not loaded.
+`;
+async function capExport(){
+  const b = $("btnCapExport");
+  if (CAP.prepared){                                                    // second tap: share inside the tap
+    const f = CAP.prepared;
+    try {
+      if (navigator.canShare && navigator.canShare({ files:[f] })){ await navigator.share({ files:[f], title:f.name }); return; }
+    } catch(e){ if (e && e.name === "AbortError") return; }
+    const a = document.createElement("a"); a.href = URL.createObjectURL(f); a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    return;
+  }
+  if (!CAP.count){ toast("No captures saved yet."); return; }
+  b.textContent = "Building…";
+  try {
+    const all = await capTx("readonly", st => st.getAll()) || [], enc = new TextEncoder(), files = [{ name:"README.txt", data:enc.encode(CAP_README) }];
+    for (const r of all){
+      files.push({ name:`${r.id}/meta.json`, data:enc.encode(r.meta) });
+      if (r.jpg) files.push({ name:`${r.id}/frame.jpg`, data:new Uint8Array(await r.jpg.arrayBuffer()) });
+    }
+    const zip = makeZip(files), stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+    CAP.prepared = new File([zip], `sightline-captures-${stamp}.zip`, { type:"application/zip" });
+    b.textContent = `Share zip (${(zip.size/1048576).toFixed(1)} MB)`;
+  } catch(e){ b.textContent = "Export zip"; toast("Export failed: " + (e.message || e)); }
+}
+let clearArm = 0;
+$("btnCapClear").onclick = async () => {
+  const b = $("btnCapClear");
+  if (!CAP.count){ toast("No captures saved yet."); return; }
+  if (Date.now() - clearArm > 4000){ clearArm = Date.now(); b.textContent = `Tap again to delete ${CAP.count}`; setTimeout(() => { if (Date.now() - clearArm >= 4000) b.textContent = "Delete all"; }, 4100); return; }
+  clearArm = 0;
+  try { await capTx("readwrite", st => st.clear()); } catch(e){ toast("Delete failed: " + (e.message || e)); }
+  CAP.prepared = null; $("btnCapExport").textContent = "Export zip"; b.textContent = "Delete all"; await capRefreshCount(); toast("Captures deleted from this phone.");
+};
+$("btnCap").onclick = () => { if (!S.pos) toast("No location yet: the capture will have no position or horizon."); capture(); };
+$("btnCapExport").onclick = capExport;
+capRefreshCount();
+
 /* status panel */
 $("statusBtn").onclick = e => {
   e.stopPropagation();
@@ -1193,7 +1361,7 @@ document.addEventListener("click", e => { if (!$("statusPanel").hidden && !$("st
 setInterval(updateChips, 1000);
 
 /* debug snapshot */
-function snapshot(){
+function snapshot(full){
   const v = $("cam"), m = measured(), c = corrected();
   const settings = {}; SAVED.concat(["sim","simAz","simEl"]).forEach(id => { const el = $(id); settings[id] = el.type === "checkbox" ? el.checked : el.value; });
   let demHere = null; try { demHere = S.pos ? r3(elevAt(S.pos[0], S.pos[1])) : null; } catch(e){}
@@ -1218,7 +1386,8 @@ function snapshot(){
       hit:f.hit && { lat:r3(f.hit.lat*100)/100, lon:r3(f.hit.lon*100)/100, d:r3(f.hit.d), elev:r3(f.hit.elev) },
       sky:f.sky && { d:r3(f.sky.d), ang:r3(f.sky.ang), elev:r3(f.sky.elev) } },
     locked:S.locked, settings, storage:{ ...STORE, savedNow:saved, origin:location.origin, path:location.pathname }, counts:DBG.counts,
-    raw:{ orientation:DBG.orient, orientationAbsolute:DBG.abs, gps:DBG.gps }, errors:DBG.errors,
+    raw:full ? { orientation:DBG.orient.slice(), orientationAbsolute:DBG.abs.slice(), gps:DBG.gps.slice() }
+             : { orientation:DBG.orient.slice(-20), orientationAbsolute:DBG.abs.slice(-20), gps:DBG.gps.slice(-20) }, errors:DBG.errors,
   };
 }
 function fillDbg(){ const t = $("dbgOut"); t.value = JSON.stringify(snapshot(), null, 1); return t; }

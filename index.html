@@ -143,6 +143,8 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 
   <h2>View</h2>
   <div class="row"><label for="camOn">Camera behind reticle</label><input id="camOn" type="checkbox" checked></div>
+  <div class="row"><label for="focusMode">Camera focus</label><select id="focusMode"><option value="centre" selected>On the crosshair</option><option value="far">Far (landscape)</option><option value="default">Phone default</option></select></div>
+  <div class="row"><span>Focus support</span><span id="focusInfo" class="mono" style="text-align:right">—</span></div>
   <div class="row"><label for="arOn">AR street overlay</label><input id="arOn" type="checkbox"></div>
   <div class="row"><label for="arRad">Street radius (m)</label><select id="arRad"><option>800</option><option selected>1500</option><option>3000</option></select></div>
   <div class="row"><label for="fov">Camera FOV, long side (°)</label><input id="fov" type="number" step="1" value="66"></div>
@@ -162,6 +164,8 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div class="row"><span>Saved on this phone</span><span id="capCount" class="mono">0</span></div>
   <div class="row"><label for="capNote">Note for next captures</label><input id="capNote" type="text" placeholder="e.g. ridge north of hut" style="flex:1;min-width:0;font:13px var(--mono);background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:3px;padding:6px"></div>
   <div class="row"><button id="btnCapExport" class="primary">Export zip</button><button id="btnCapClear">Delete all</button></div>
+  <div class="row" style="justify-content:flex-start"><a id="capSaveLink" hidden href="#" style="color:var(--ray);font:600 14px var(--sans)"></a></div>
+  <p id="capSaveNote" class="note" hidden>The zip goes to your phone's Downloads folder. In this chat, attach it with the + button and choose it from Files.</p>
   <h2>Debug</h2>
   <p class="note">Shows the last 20 raw readings from each sensor stream plus GPS, heading state, settings and the last fix. Copy it and paste it into a chat.</p>
   <div class="row"><button id="btnDbgCopy" class="primary">Copy snapshot</button><button id="btnDbgShow">Show</button></div>
@@ -404,6 +408,7 @@ async function startCam(){
     camStream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:"environment" } }, audio:false });
     camStream.getVideoTracks().forEach(t => t.addEventListener("ended", () => { if (!document.hidden) restartCam(); }));
     $("cam").srcObject = camStream; $("cam").hidden = false; await $("cam").play();
+    await applyFocus();
   } catch(e){
     $("cam").hidden = true; camStream = null;
     S.camErr = e.name === "NotAllowedError" ? "Permission denied" : e.name === "NotFoundError" ? "No camera found" : (e.message || e.name);
@@ -411,6 +416,29 @@ async function startCam(){
   camStarting = false;
   updateChips();
 }
+/* focus: Chrome on Android exposes focusMode / pointsOfInterest / focusDistance on the camera track where the
+   phone supports them. "centre" = keep refocusing on the crosshair; "far" = lock focus at the farthest distance. */
+async function applyFocus(){
+  const t = camStream && camStream.getVideoTracks()[0]; if (!t) return;
+  const caps = t.getCapabilities ? t.getCapabilities() : {}, mode = $("focusMode").value, modes = caps.focusMode || [];
+  const tryC = async c => { try { await t.applyConstraints({ advanced:[c] }); return true; } catch(e){ return false; } };
+  let did = "phone default";
+  if (mode === "centre"){
+    const cont = modes.includes("continuous") ? "continuous" : modes.includes("single-shot") ? "single-shot" : null;
+    if (caps.pointsOfInterest !== undefined || "pointsOfInterest" in caps){
+      if (await tryC({ ...(cont ? { focusMode:cont } : {}), pointsOfInterest:[{ x:0.5, y:0.5 }] })) did = `${cont || "auto"} on crosshair`;
+    } else if (cont && await tryC({ focusMode:cont })) did = `${cont} (no focus point support)`;
+  } else if (mode === "far"){
+    if (modes.includes("manual") && caps.focusDistance){
+      if (await tryC({ focusMode:"manual", focusDistance:caps.focusDistance.max })) did = `manual at ${caps.focusDistance.max}`;
+    } else if (modes.includes("continuous") && await tryC({ focusMode:"continuous" })) did = "continuous (no manual focus)";
+  }
+  const st = t.getSettings ? t.getSettings() : {};
+  S.camFocus = { requested:mode, applied:did, modes, focusDistance:caps.focusDistance || null, pointsOfInterest:"pointsOfInterest" in caps,
+    settings:{ focusMode:st.focusMode, focusDistance:st.focusDistance, pointsOfInterest:st.pointsOfInterest, width:st.width, height:st.height, zoom:st.zoom } };
+  $("focusInfo").textContent = modes.length ? did : "not exposed by this phone";
+}
+$("focusMode").addEventListener("change", applyFocus);
 function restartCam(){ stopCam(); if ($("camOn").checked && S.sensorsOn) startCam(); }
 function camHealthy(){
   if (!camStream) return false;
@@ -1546,7 +1574,7 @@ async function capture(){
     };
     await capTx("readwrite", st => st.put({ id, at:meta.at, meta:JSON.stringify(meta), jpg:frame ? frame.blob : null }));
     await capRefreshCount();
-    CAP.prepared = null; $("btnCapExport").textContent = "Export zip";
+    CAP.prepared = null; $("capSaveLink").hidden = true; $("capSaveNote").hidden = true;
     if (S.calMode === 2) banner(`Saved labelled frame ${CAP.count}. Aim again and press Capture for another, Set to calibrate, or ✕ to finish.`, true);
     else toast(`Captured ${CAP.count}${aim ? " (labelled)" : ""}${frame ? "" : ", no camera frame"}${meta.horizon && meta.horizon.missing ? ", some terrain missing" : ""}.`);
   } catch(e){ toast("Capture failed: " + (e.message || e)); }
@@ -1598,29 +1626,33 @@ meta.json
              refraction k), dist = distance of the ridge forming it (m), elev = its terrain height (m).
              missing > 0 means some elevation tiles were not loaded.
 `;
+async function buildCaptureZip(){
+  const all = await capTx("readonly", st => st.getAll()) || [], enc = new TextEncoder(), files = [{ name:"README.txt", data:enc.encode(CAP_README) }];
+  for (const r of all){
+    files.push({ name:`${r.id}/meta.json`, data:enc.encode(r.meta) });
+    if (r.jpg) files.push({ name:`${r.id}/frame.jpg`, data:new Uint8Array(await r.jpg.arrayBuffer()) });
+  }
+  const zip = makeZip(files), stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+  return new File([zip], `sightline-captures-${stamp}.zip`, { type:"application/zip" });
+}
+function showSaveLink(f){
+  const l = $("capSaveLink");
+  if (CAP.url) URL.revokeObjectURL(CAP.url);
+  CAP.url = URL.createObjectURL(f);
+  l.href = CAP.url; l.download = f.name; l.textContent = `Save ${f.name} (${(f.size/1048576).toFixed(1)} MB)`; l.hidden = false;
+  $("capSaveNote").hidden = false;
+}
 async function capExport(){
   const b = $("btnCapExport");
-  if (CAP.prepared){                                                    // second tap: share inside the tap
-    const f = CAP.prepared;
-    try {
-      if (navigator.canShare && navigator.canShare({ files:[f] })){ await navigator.share({ files:[f], title:f.name }); return; }
-    } catch(e){ if (e && e.name === "AbortError") return; }
-    const a = document.createElement("a"); a.href = URL.createObjectURL(f); a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-    return;
-  }
   if (!CAP.count){ toast("No captures saved yet."); return; }
-  b.textContent = "Building…";
+  b.textContent = "Building…"; b.disabled = true;
   try {
-    const all = await capTx("readonly", st => st.getAll()) || [], enc = new TextEncoder(), files = [{ name:"README.txt", data:enc.encode(CAP_README) }];
-    for (const r of all){
-      files.push({ name:`${r.id}/meta.json`, data:enc.encode(r.meta) });
-      if (r.jpg) files.push({ name:`${r.id}/frame.jpg`, data:new Uint8Array(await r.jpg.arrayBuffer()) });
-    }
-    const zip = makeZip(files), stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
-    CAP.prepared = new File([zip], `sightline-captures-${stamp}.zip`, { type:"application/zip" });
-    b.textContent = `Share zip (${(zip.size/1048576).toFixed(1)} MB)`;
-  } catch(e){ b.textContent = "Export zip"; toast("Export failed: " + (e.message || e)); }
+    const f = await buildCaptureZip(); CAP.prepared = f;
+    showSaveLink(f);
+    $("capSaveLink").click();                                          // starts the download; Chrome shows it in its downloads bar
+    toast(`Saving ${f.name}. If no download appears, tap the Save link under Captures.`);
+  } catch(e){ toast("Export failed: " + (e.message || e)); }
+  b.textContent = "Export zip"; b.disabled = false;
 }
 let clearArm = 0;
 $("btnCapClear").onclick = async () => {
@@ -1629,7 +1661,7 @@ $("btnCapClear").onclick = async () => {
   if (Date.now() - clearArm > 4000){ clearArm = Date.now(); b.textContent = `Tap again to delete ${CAP.count}`; setTimeout(() => { if (Date.now() - clearArm >= 4000) b.textContent = "Delete all"; }, 4100); return; }
   clearArm = 0;
   try { await capTx("readwrite", st => st.clear()); } catch(e){ toast("Delete failed: " + (e.message || e)); }
-  CAP.prepared = null; $("btnCapExport").textContent = "Export zip"; b.textContent = "Delete all"; await capRefreshCount(); toast("Captures deleted from this phone.");
+  CAP.prepared = null; $("capSaveLink").hidden = true; $("capSaveNote").hidden = true; b.textContent = "Delete all"; await capRefreshCount(); toast("Captures deleted from this phone.");
 };
 $("btnCap").onclick = () => { if (!S.pos) toast("No location yet: the capture will have no position or horizon."); capture(); };
 $("btnCapExport").onclick = capExport;
@@ -1651,6 +1683,7 @@ function snapshot(full){
   const f = S.lastFix;
   return {
     app:"sightline", build:"2026-11-04", at:new Date().toISOString(), tNow:Math.round(performance.now()),
+    cameraFocus:S.camFocus || null,
     env:{ ua:navigator.userAgent, secure:isSecureContext, screen:`${screen.width}x${screen.height}@${devicePixelRatio}`,
       viewport:`${innerWidth}x${innerHeight}`, orient:screen.orientation ? `${screen.orientation.type} ${screen.orientation.angle}` : window.orientation,
       hasAbsEvent:"ondeviceorientationabsolute" in window, video:v.videoWidth ? `${v.videoWidth}x${v.videoHeight}` : (v.hidden ? "off" : "no frames") },
@@ -1685,7 +1718,7 @@ $("btnDbgCopy").onclick = () => {
 };
 
 /* persist settings in this browser */
-const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","topoOn","topoInt","topoRange","layer","skyOn","skyShow"];
+const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","topoOn","topoInt","topoRange","layer","skyOn","skyShow","focusMode"];
 let saved = {};
 const STORE = { raw:null, readErr:null, writeErr:null, writes:0, restored:[], mismatched:[] };
 try { STORE.raw = localStorage.getItem("sightline.settings"); saved = JSON.parse(STORE.raw) || {}; } catch(e){ STORE.readErr = String(e); }

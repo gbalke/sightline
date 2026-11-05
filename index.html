@@ -130,6 +130,8 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <h2>Heading corrections</h2>
   <div class="row"><label for="decl">Magnetic declination (° east +)</label><input id="decl" type="number" step="0.1" value="0"></div>
   <div class="row"><span>Landmark calibration offset</span><span id="calShow" class="mono">az +0.0° · el +0.0°</span></div>
+  <div class="row"><span>Compass check</span><span id="cqNow" class="mono" style="text-align:right;max-width:60%">—</span></div>
+  <div class="row"><button id="btnCqReset">Re-check compass</button></div>
   <div class="row"><label for="lockNorth">Ignore compass after calibrating (gyro only)</label><input id="lockNorth" type="checkbox" checked></div>
   <div class="row"><button id="btnCalReset">Clear calibration</button></div>
   <p class="note">Turning is always measured by the gyro. The compass only sets north, slowly. Magnetic cases, mounts and car dashboards distort it; calibrating on a landmark you can identify on the map fixes north, and with the option above the compass is then ignored until you clear calibration. Recalibrate if the heading creeps after several minutes.</p>
@@ -153,7 +155,8 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div class="row"><label for="topoInt">Contour interval</label><select id="topoInt"><option value="auto" selected>Auto</option><option value="5">5 m</option><option value="10">10 m</option><option value="20">20 m</option><option value="25">25 m</option><option value="50">50 m</option><option value="100">100 m</option></select></div>
   <div class="row"><label for="topoRange">Contour range</label><select id="topoRange"><option value="1000">1 km</option><option value="2000">2 km</option><option value="3000" selected>3 km</option><option value="5000">5 km</option></select></div>
   <p class="note">If overlay streets look stretched or squeezed relative to the real ones, adjust FOV. If they are shifted sideways or up/down, calibrate on a landmark. Contours are drawn from the same elevation data as the ray, every fifth line thicker and labelled; anything hidden behind terrain is left out. Buildings and trees are not in the elevation data, so they don't hide anything. Street data © OpenStreetMap contributors.</p>
-  <div class="row"><label for="layer">Map</label><select id="layer"><option value="topo">Topo</option><option value="sat">Satellite</option></select></div>
+  <div class="row"><label for="layer">Map</label><select id="layer"><option value="topo">Topo</option><option value="sat">Satellite + labels</option><option value="satPlain">Satellite only</option></select></div>
+  <div class="row"><label for="mapMarks">Peaks, parks and landmarks on the map</label><input id="mapMarks" type="checkbox" checked></div>
 
   <h2>Simulate (no sensors)</h2>
   <div class="row"><label for="sim">Simulate mode — tap map to place yourself</label><input id="sim" type="checkbox"></div>
@@ -345,6 +348,7 @@ function fuse(rawAx, compassAz){
       const mean = Math.atan2(sy, cx)*R2D; steady = win.every(w => Math.abs(wrap180(w.v - mean)) < 1.5);
     }
     S.offSteady = steady;
+    compassQualitySample(now, inst, refAz(rawAx));
     if (!S.northLocked && !(J.cand)){
       if (S.northOff == null) S.northOff = inst;
       else S.northOff += Math.min(1, (now - (S.fuseT || now))/(steady ? 2000 : 15000))*wrap180(inst - S.northOff);
@@ -389,6 +393,41 @@ function onOrient(e){
   }
   if (!ax) return;
   applyAxes(ax, kind + (S.northLocked ? " · gyro, north locked" : " · gyro + compass") + (S.resetCount ? ` · ${S.resetCount} gyro reset${S.resetCount > 1 ? "s" : ""} caught` : ""));
+}
+/* Compass quality. A clean compass keeps the compass-minus-gyro gap the same whatever way the phone points.
+   A magnet on or near the phone (MagSafe wallet, magnetic case or mount, car body) adds an error that changes with
+   direction, so the gap swings as you turn: that is what made 90 deg turns read as 180 deg. So: record the gap
+   against gyro heading over the last 60 s, and once you have turned through at least 60 deg, measure how much
+   it swings. Both readings are already available, so this needs no extra sensor. */
+const CQ = { samples:[], lastT:0, level:"unknown", swing:null, span:0, tipShown:false };
+function compassQualitySample(now, inst, gyroAz){
+  if (now - CQ.lastT < 100) return; CQ.lastT = now;
+  CQ.samples.push({ t:now, inst, h:((gyroAz + (S.northOff || 0)) % 360 + 360) % 360 });
+  while (CQ.samples.length && now - CQ.samples[0].t > 60000) CQ.samples.shift();
+  if (S.jump && S.jump.cand) return;
+  // heading coverage: 10 deg bins that have data
+  const bins = new Map();
+  for (const q of CQ.samples){ const b = Math.floor(q.h/10); const L = bins.get(b) || []; L.push(q.inst); bins.set(b, L); }
+  CQ.span = bins.size*10;
+  if (CQ.span < 60){ CQ.level = "unknown"; CQ.swing = null; return; }
+  // circular mean of the gap per bin, then the spread of those means
+  const means = [...bins.values()].filter(L => L.length >= 3).map(L => { let c = 0, s2 = 0; for (const v of L){ c += Math.cos(v*D2R); s2 += Math.sin(v*D2R); } return Math.atan2(s2, c)*R2D; });
+  if (means.length < 5){ CQ.level = "unknown"; CQ.swing = null; return; }
+  let c = 0, s2 = 0; for (const v of means){ c += Math.cos(v*D2R); s2 += Math.sin(v*D2R); }
+  const mid = Math.atan2(s2, c)*R2D, dev = means.map(v => Math.abs(wrap180(v - mid))).sort((a, b) => a - b);
+  CQ.swing = 2*dev.at(Math.floor(0.9*(dev.length - 1)));                  // ~peak-to-peak, ignoring the worst bin
+  CQ.level = CQ.swing < 6 ? "good" : CQ.swing < 15 ? "fair" : "poor";
+  if (CQ.level === "poor" && !CQ.tipShown && !S.northLocked){ CQ.tipShown = true; toast(`Compass is off by up to ${CQ.swing.toFixed(0)}° depending on direction. Remove any MagSafe wallet, magnetic case or mount, step away from cars and metal, then wave the phone in a figure-8.`); }
+}
+function compassAdvice(){
+  const F = typeof SKY !== "undefined" ? SKY.f : null, skyLocked = F && F.n && skyOn();
+  if (skyLocked) return { level:"ok", text:`Locked to the skyline (±${Math.sqrt(F.vaz).toFixed(1)}°); compass not needed` };
+  if (S.northLocked) return { level:"ok", text:"Locked to your landmark calibration; compass ignored. Recalibrate if aim drifts." };
+  if (!S.offSteady && S.jump && S.northOff != null && Math.abs(wrap180(S.jump.base - S.northOff)) > 5) return { level:"busy", text:"Compass settling: hold still a few seconds" };
+  if (CQ.level === "unknown") return { level:"busy", text:`Unchecked: turn slowly through 90° to test the compass (${CQ.span}° covered)` };
+  if (CQ.level === "good") return { level:"ok", text:`Good: compass consistent to ±${(CQ.swing/2).toFixed(0)}° as you turn` };
+  if (CQ.level === "fair") return { level:"busy", text:`Fair: compass swings ±${(CQ.swing/2).toFixed(0)}° with direction. Check for a magnetic wallet, case or mount, or calibrate on a landmark.` };
+  return { level:"bad", text:`Poor: compass swings ±${(CQ.swing/2).toFixed(0)}° with direction. Remove MagSafe wallets, magnetic cases or mounts, move away from cars and metal, wave the phone in a figure-8, or calibrate on a landmark.` };
 }
 function applyAxes(ax, kind){
   S.kind = kind;
@@ -496,7 +535,12 @@ function stopCam(){ if (camStream){ camStream.getTracks().forEach(t => t.stop())
 const map = L.map("map", { zoomControl:false, attributionControl:true }).setView([-41.29, 174.78], 11);
 const layers = {
   topo: L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", { maxZoom:17, attribution:"© OpenStreetMap, SRTM · OpenTopoMap (CC-BY-SA)" }),
-  sat: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { maxZoom:19, attribution:"Imagery © Esri" }),
+  sat: L.layerGroup([
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { maxZoom:19, attribution:"Imagery © Esri" }),
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}", { maxZoom:19, opacity:0.9 }),
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}", { maxZoom:19, attribution:"Labels © Esri" }),
+  ]),
+  satPlain: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { maxZoom:19, attribution:"Imagery © Esri" }),
 };
 layers.topo.addTo(map);
 const gObs = L.circleMarker([0,0], { radius:7, color:"#0f1517", weight:2, fillColor:"#f2c94c", fillOpacity:1 });
@@ -853,6 +897,75 @@ async function loadStreets(){
   }
   AR.loading = false; updateChips();
 }
+/* ---------- map marks: peaks (with height), parks and landmarks, from OpenFreeMap vector tiles ----------
+   Topo already shows peaks, so these go on whenever the checkbox is on; they matter most on satellite. */
+const MARKS = { layer:L.layerGroup(), tiles:new Map(), job:0 };
+const POI_KEEP = new Set(["attraction", "viewpoint", "museum", "monument", "memorial", "castle", "ruins", "campsite", "shelter", "alpine_hut",
+  "information", "place_of_worship", "lighthouse", "tower", "park", "golf", "stadium", "school", "college", "hospital", "town_hall", "railway", "bus", "aerialway", "ferry_terminal"]);
+function markIcon(kind, text){
+  const c = kind === "peak" ? "#ffe08a" : kind === "park" ? "#9be7a1" : "#d6ecff";
+  const sym = kind === "peak" ? "▲" : kind === "park" ? "◆" : "●";
+  return L.divIcon({ className:"", iconSize:null, iconAnchor:[5, 7],
+    html:`<div style="font:600 11px/1.15 ${getComputedStyle(document.documentElement).getPropertyValue("--sans").replace(/"/g, "'")};color:${c};text-shadow:0 0 3px #000,0 0 2px #000,0 0 1px #000;white-space:nowrap;pointer-events:none">${sym} ${text.replace(/[&<>"]/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" })[ch])}</div>` });
+}
+async function marksTile(z, x, y){
+  const key = `${z}/${x}/${y}`; if (MARKS.tiles.has(key)) return MARKS.tiles.get(key);
+  const p = (async () => {
+    if (!ofmTemplate){ const tj = await (await fetchT("https://tiles.openfreemap.org/planet", 15000)).json(); ofmTemplate = tj.tiles[0]; }
+    const n = 2**z, url = ofmTemplate.replace("{z}", z).replace("{x}", ((x % n) + n) % n).replace("{y}", y);
+    const layers = mvtDecode(await gunzipIfNeeded(await (await fetchT(url, 20000)).arrayBuffer()));
+    const out = [];
+    const toLL = (E, px, py) => { const X = (x + px/E)/n, Y = (y + py/E)/n; return [Math.atan(Math.sinh(Math.PI*(1 - 2*Y)))*R2D, X*360 - 180]; };
+    const inside = (E, px, py) => px >= 0 && px < E && py >= 0 && py < E;
+    const pk = layers.mountain_peak;
+    if (pk) for (const f of pk.features){
+      if (f.type !== 1 || !f.props.name) continue; const g = mvtLines(f.geom)[0]; if (!g || !inside(pk.extent, g[0][0], g[0][1])) continue;
+      const ele = f.props.ele != null ? Math.round(+f.props.ele) : null;
+      out.push({ kind:"peak", ll:toLL(pk.extent, g[0][0], g[0][1]), text:f.props.name + (ele ? ` ${ele} m` : ""), rank:f.props.rank || 9 });
+    }
+    const pa = layers.park;
+    if (pa) for (const f of pa.features){
+      const name = f.props.name; if (!name || f.type !== 3) continue;
+      const pts = mvtLines(f.geom).flat(); if (!pts.length) continue;
+      let sx = 0, sy = 0; for (const q of pts){ sx += q[0]; sy += q[1]; } const cx = sx/pts.length, cy = sy/pts.length;
+      if (!inside(pa.extent, cx, cy)) continue;
+      out.push({ kind:"park", ll:toLL(pa.extent, cx, cy), text:name, rank:5 });
+    }
+    const po = layers.poi;
+    if (po) for (const f of po.features){
+      if (f.type !== 1 || !f.props.name || !POI_KEEP.has(f.props.class)) continue; const g = mvtLines(f.geom)[0]; if (!g || !inside(po.extent, g[0][0], g[0][1])) continue;
+      out.push({ kind:"poi", ll:toLL(po.extent, g[0][0], g[0][1]), text:f.props.name, rank:f.props.rank || 9 });
+    }
+    return out;
+  })().catch(() => []);
+  MARKS.tiles.set(key, p); if (MARKS.tiles.size > 300) MARKS.tiles.delete(MARKS.tiles.keys().next().value);
+  return p;
+}
+async function refreshMarks(){
+  const job = ++MARKS.job;
+  const credit = "Places © OpenStreetMap contributors, OpenFreeMap";
+  if (!$("mapMarks").checked){ MARKS.layer.remove(); map.attributionControl.removeAttribution(credit); return; }
+  MARKS.layer.addTo(map); map.attributionControl.addAttribution(credit);
+  const zm = map.getZoom(), z = Math.max(5, Math.min(14, Math.round(zm) - 1)), b = map.getBounds().pad(0.15);
+  const [x0, y0] = tileXY(b.getNorth(), b.getWest(), z), [x1, y1] = tileXY(b.getSouth(), b.getEast(), z);
+  const jobs = []; for (let x = Math.floor(x0); x <= Math.floor(x1); x++) for (let y = Math.floor(y0); y <= Math.floor(y1); y++) jobs.push(marksTile(z, x, y));
+  if (jobs.length > 36) return;
+  const all = (await Promise.all(jobs)).flat(); if (job !== MARKS.job) return;
+  const showPoi = zm >= 14, showPark = zm >= 12, onTopo = $("layer").value === "topo";
+  const keep = all.filter(m => m.kind === "peak" ? !onTopo : m.kind === "park" ? showPark : showPoi)
+    .sort((a, b) => (a.kind === "peak" ? 0 : 1) - (b.kind === "peak" ? 0 : 1) || a.rank - b.rank).slice(0, 120);
+  MARKS.layer.clearLayers();
+  const placed = [], named = new Set();                                  // drop overlapping labels, and parks split across tiles
+  for (const m of keep){
+    if (m.kind === "park"){ if (named.has(m.text)) continue; named.add(m.text); }
+    const p = map.latLngToContainerPoint(m.ll);
+    if (placed.some(q => Math.abs(q.x - p.x) < 70 && Math.abs(q.y - p.y) < 14)) continue;
+    placed.push(p); L.marker(m.ll, { icon:markIcon(m.kind, m.text), interactive:false, keyboard:false }).addTo(MARKS.layer);
+  }
+}
+map.on("moveend", () => refreshMarks());
+$("mapMarks").addEventListener("change", refreshMarks);
+
 /* ---------- terrain occlusion: one horizon sweep, shared by streets and contours ----------
    For NA bearings around the observer, march outward and keep the running maximum terrain "slope"
    (height above eye, minus curvature, over distance). A point is visible when its own slope reaches the
@@ -1158,8 +1271,8 @@ function statusItems(){
   else if (!started) it.push(["Heading", "off", "Press Start"]);
   else if (S.vec){
     const J = S.jump, gap = J && J.base != null && S.northOff != null ? Math.abs(wrap180(J.base - S.northOff)) : 0;
-    if (!S.northLocked && !S.offSteady && gap > 5) it.push(["Heading", "busy", `Compass settling, ${gap.toFixed(0)}° to go · hold still a few seconds`]);
-    else it.push(["Heading", /compass only|waiting/.test(S.kind) ? "busy" : "ok", S.kind]);
+    const adv = compassAdvice();
+    it.push(["Heading", /compass only|waiting/.test(S.kind) ? "busy" : adv.level, adv.text]);
   }
   else if (since > 4) it.push(["Heading", "bad", "No motion sensor data"]);
   else it.push(["Heading", "busy", S.kind === "waiting for compass" ? "Waiting for compass" : "Starting sensors"]);
@@ -1231,6 +1344,7 @@ function updateChips(){
     $("statusPanel").querySelectorAll(".st span").forEach((s, i) => s.textContent = it[i][2]);
   }
   $("skyNow").textContent = skyOn() ? skyText() : "off";
+  $("cqNow").textContent = compassAdvice().text;
   $("calShow").textContent = `az ${S.cal.az >= 0 ? "+" : ""}${S.cal.az.toFixed(1)}° · el ${S.cal.el >= 0 ? "+" : ""}${S.cal.el.toFixed(2)}°`;
 }
 let toastT;
@@ -1286,7 +1400,7 @@ $("range").onchange = () => {
 $("camOn").onchange = () => { if ($("camOn").checked){ if (S.sensorsOn) startCam(); } else stopCam(); };
 $("arOn").onchange = () => { updateChips(); if ($("arOn").checked){ if (!S.pos) toast("AR streets load once you have a location."); maybeReloadStreets(); } };
 $("arRad").onchange = () => { AR.origin = null; AR.retryAt = 0; maybeReloadStreets(); };
-$("layer").onchange = () => { Object.values(layers).forEach(l => map.removeLayer(l)); layers[$("layer").value].addTo(map); };
+$("layer").onchange = () => { Object.values(layers).forEach(l => map.removeLayer(l)); (layers[$("layer").value] || layers.topo).addTo(map); refreshMarks(); };
 $("sim").onchange = () => { updateChips(); if ($("sim").checked) toast("Simulate on: tap the map to place yourself, then use the Az/El sliders."); };
 $("simAz").oninput = () => $("simAzV").textContent = (+$("simAz").value).toFixed(1) + "°";
 $("simEl").oninput = () => $("simElV").textContent = (+$("simEl").value).toFixed(2) + "°";
@@ -1543,6 +1657,7 @@ async function skyStep(){
   finally { SKY.busy = false; updateChips(); }
 }
 setInterval(skyStep, 1000);
+$("btnCqReset").onclick = () => { CQ.samples = []; CQ.level = "unknown"; CQ.swing = null; CQ.tipShown = false; updateChips(); toast("Turn slowly through 90° or more to re-check the compass."); };
 $("btnSkyReset").onclick = () => { SKY.f = SKY_INIT(); SKY.rejects = 0; SKY.last = null; updateChips(); toast("Skyline fix cleared."); };
 $("skyOn").addEventListener("change", () => { updateChips(); if (skyOn() && !$("camOn").checked) toast("Skyline lock needs the camera: turn on Camera behind reticle."); });
 function skyText(){
@@ -1726,6 +1841,7 @@ function snapshot(full){
   return {
     app:"sightline", build:"2026-11-04", at:new Date().toISOString(), tNow:Math.round(performance.now()),
     cameraFocus:S.camFocus || null,
+    compassQuality:{ level:CQ.level, swingDeg:CQ.swing === null ? null : r3(CQ.swing), spanDeg:CQ.span, advice:compassAdvice().text },
     env:{ ua:navigator.userAgent, secure:isSecureContext, screen:`${screen.width}x${screen.height}@${devicePixelRatio}`,
       viewport:`${innerWidth}x${innerHeight}`, orient:screen.orientation ? `${screen.orientation.type} ${screen.orientation.angle}` : window.orientation,
       hasAbsEvent:"ondeviceorientationabsolute" in window, video:v.videoWidth ? `${v.videoWidth}x${v.videoHeight}` : (v.hidden ? "off" : "no frames") },
@@ -1761,7 +1877,7 @@ $("btnDbgCopy").onclick = () => {
 };
 
 /* persist settings in this browser */
-const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","topoOn","topoInt","topoRange","layer","skyOn","skyShow","focusMode"];
+const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","topoOn","topoInt","topoRange","layer","skyOn","skyShow","focusMode","mapMarks"];
 let saved = {};
 const STORE = { raw:null, readErr:null, writeErr:null, writes:0, restored:[], mismatched:[] };
 try { STORE.raw = localStorage.getItem("sightline.settings"); saved = JSON.parse(STORE.raw) || {}; } catch(e){ STORE.readErr = String(e); }
@@ -1789,7 +1905,8 @@ addEventListener("pageshow", () => SAVED.forEach(id => {
     el.dispatchEvent(new Event("change"));
   }
 }));
-if ($("layer").value !== "topo"){ map.removeLayer(layers.topo); layers[$("layer").value].addTo(map); }
+if ($("layer").value !== "topo"){ map.removeLayer(layers.topo); (layers[$("layer").value] || layers.topo).addTo(map); }
+refreshMarks();
 dem.z = demZoomFor(+$("range").value);
 updateChips();
 if (!window.isSecureContext) toast("This page needs HTTPS for GPS, compass and camera.");

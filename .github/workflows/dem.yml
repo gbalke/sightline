@@ -5,13 +5,12 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          mkdir t
-          for x in $(seq 501 508); do for y in $(seq 317 324); do curl -sf -o t/9_${x}_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/9/$x/$y.png & done; wait; done
-          for x in $(seq 1002 1016); do for y in $(seq 634 648); do curl -sf -o t/10_${x}_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/10/$x/$y.png & done; wait; done
-          ls t | wc -l
       - uses: actions/checkout@v4
         with: { path: repo }
       - run: |
-          mv t repo/dem-tiles && cd repo && git config user.name ci && git config user.email ci@example.invalid
-          git add dem-tiles && git commit -qm "tiles" && git push
+          mkdir -p repo/dem-tiles2 && cd repo/dem-tiles2
+          for x in $(seq 4029 4033); do for y in $(seq 2561 2565); do curl -sf -o 12_${x}_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/12/$x/$y.png & done; done; wait
+          for x in $(seq 4034 4039); do for y in $(seq 2562 2567); do curl -sf -o 12_${x}_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/12/$x/$y.png & done; done; wait
+          for y in $(seq 317 324); do curl -sf -o 9_500_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/9/500/$y.png & done; wait
+          ls | wc -l
+          cd .. && git config user.name ci && git config user.email ci@example.invalid && git add dem-tiles2 && git commit -qm "tiles 2" && git push

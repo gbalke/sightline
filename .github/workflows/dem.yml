@@ -1,0 +1,13 @@
+name: dem-fetch
+on: { push: { branches: [dem-fetch] } }
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir t
+          for x in $(seq 501 508); do for y in $(seq 317 324); do curl -sf -o t/9_${x}_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/9/$x/$y.png & done; wait; done
+          for x in $(seq 1002 1016); do for y in $(seq 634 648); do curl -sf -o t/10_${x}_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/10/$x/$y.png & done; wait; done
+          ls t | wc -l
+      - uses: actions/upload-artifact@v4
+        with: { name: tiles, path: t }

@@ -1969,7 +1969,7 @@ function snapshot(full){
   let demHere = null; try { demHere = S.pos ? r3(elevAt(S.pos[0], S.pos[1])) : null; } catch(e){}
   const f = S.lastFix;
   return {
-    app:"sightline", build:"2026-11-04", at:new Date().toISOString(), tNow:Math.round(performance.now()),
+    app:"sightline", build:"2026-11-07 far-horizon", at:new Date().toISOString(), tNow:Math.round(performance.now()),
     cameraFocus:S.camFocus || null,
     compassQuality:{ level:CQ.level, swingDeg:CQ.swing === null ? null : r3(CQ.swing), spanDeg:CQ.span, advice:compassAdvice().text },
     env:{ ua:navigator.userAgent, secure:isSecureContext, screen:`${screen.width}x${screen.height}@${devicePixelRatio}`,

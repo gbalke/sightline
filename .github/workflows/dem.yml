@@ -1,5 +1,6 @@
 name: dem-fetch
 on: { push: { branches: [dem-fetch] } }
+permissions: { contents: write }
 jobs:
   fetch:
     runs-on: ubuntu-latest
@@ -9,5 +10,8 @@ jobs:
           for x in $(seq 501 508); do for y in $(seq 317 324); do curl -sf -o t/9_${x}_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/9/$x/$y.png & done; wait; done
           for x in $(seq 1002 1016); do for y in $(seq 634 648); do curl -sf -o t/10_${x}_${y}.png https://s3.amazonaws.com/elevation-tiles-prod/terrarium/10/$x/$y.png & done; wait; done
           ls t | wc -l
-      - uses: actions/upload-artifact@v4
-        with: { name: tiles, path: t }
+      - uses: actions/checkout@v4
+        with: { path: repo }
+      - run: |
+          mv t repo/dem-tiles && cd repo && git config user.name ci && git config user.email ci@example.invalid
+          git add dem-tiles && git commit -qm "tiles" && git push

@@ -1532,10 +1532,6 @@ function skyFit(img, H, A, base){
   const out = (o) => Object.assign({ ok:false, frameW:W, frameH:Hh, ms:Math.round(performance.now() - t0) }, o);
   const Lm = new Float32Array(N), Bl = new Float32Array(N);
   for (let i = 0, j = 0; i < N; i++, j += 4){ const r = px8[j], g = px8[j+1], b = px8[j+2]; Lm[i] = (r + g + b)/3; Bl[i] = b - 0.5*(r + g); }
-  // sky brightness: median of the top fifth of the frame
-  const topS = []; for (let y = 0; y < Hh/5; y += 2) for (let x = 0; x < W; x += 3) topS.push(Lm[y*W + x]);
-  topS.sort((p, q) => p - q); const skyLvl = topS[topS.length >> 1];
-  if (!(skyLvl > 110)) return out({ why:"sky too dark to find the skyline" });
   const f = (Math.max(W, Hh)/2)/Math.tan(base.fov*D2R/2), th = base.screenAngle*D2R, ct = Math.cos(th), st = Math.sin(th);
   const AX = A.X, AY = A.Y, AZ = A.Z;
   // elevation angle (deg) of pixel (x, y) through the current pose, with pitch/roll offsets q1, q2
@@ -1553,6 +1549,15 @@ function skyFit(img, H, A, base){
       const a = Math.atan2(H.elev[i] - base.h0 - curv0*d*d, d)*R2D; if (a < aLo) aLo = a; if (a > aHi) aHi = a; } }
   if (!(aHi > -90)) return out({ why:"no terrain horizon" });
   const eLo = aLo - 3, eHi = aHi + 3;
+  // sky brightness: the top fifth of the frame; if that is dark (a ceiling, a window frame), judge it where the
+  // skyline can be instead: the bright quarter of the pixels in the band and a little above it
+  let skyLvl;
+  { const topS = []; for (let y = 0; y < Hh/5; y += 2) for (let x = 0; x < W; x += 3) topS.push(Lm[y*W + x]);
+    topS.sort((p, q) => p - q); skyLvl = topS[topS.length >> 1]; }
+  if (!(skyLvl > 110)){ const c0 = Math.cos(base.roll*D2R), s0 = Math.sin(base.roll*D2R), t0y = f*Math.tan(base.el*D2R), v = [];
+    for (let x = 2; x < W; x += 8) for (let y = 0; y < Hh; y += 4){ const e = pixEl(x, y, 0, 0, t0y, c0, s0); if (e <= eHi + 4 && e >= eLo) v.push(Lm[y*W + x]); }
+    v.sort((p, q) => p - q); skyLvl = v.length ? v[Math.floor(v.length*0.75)] : 0; }
+  if (!(skyLvl > 110)) return out({ why:"sky too dark to find the skyline" });
   // skyline row per column, in two passes (below)
   // Contrast is judged against the sky just above the step, so faint distant ranges count as long as the
   // step is crisp; soft cloud edges spread over many rows and fail the sharpness test.
@@ -1561,7 +1566,7 @@ function skyFit(img, H, A, base){
   const ty0 = f*Math.tan(base.el*D2R), cr0 = Math.cos(base.roll*D2R), sr0 = Math.sin(base.roll*D2R);
   const noise = (P, a, b) => { let z = 0, n = 0; for (let y = Math.max(1, a); y < b; y++){ z += Math.abs(P[y] - P[y - 1]); n++; } return n ? 1.25*z/n : 2; };
   // top-most step in P (prefix sums C) between rows a and b with contrast >= cMin; -1 if none
-  const findStep = (P, C, a, b, cMin, edge) => {
+  const findStep = (P, C, a, b, cMin, edge, skyOK) => {
     // edge (faint pass): row of the clear edge below; the faint range must stay darker down to it, and the
     // "below" windows are cut short there so the clear edge itself never counts as the faint step
     const mean = (u, v) => (C[v] - C[u])/(v - u);
@@ -1572,6 +1577,7 @@ function skyFit(img, H, A, base){
       const s1 = mean(y - REF, y - REF/2), s2 = mean(y - REF/2, y), sky = 2*s2 - s1, below = mean(y, e5), c = sky - below;
       if (c < cMin || s2 - below < cMin) continue;
       if (mean(y - 3, y) - mean(y, e3) < 0.45*c) continue;                 // the change is spread out: soft cloud edge
+      if (skyOK && !skyOK(y)) continue;                                     // what is above is not sky (a wall, a lamp)
       if (edge == null){ if (sky - mean(y + RUN, y + RUN + PER) < 0.5*c) continue; }   // brightens again right below: cloud band
       else { let ok = true; for (let yy = e5; yy + 2 <= edge; yy += 2) if (s2 - mean(yy, yy + 2) < 0.5*c){ ok = false; break; } if (!ok) continue; }
       let by = y, bg = -Infinity; for (let yy = Math.max(1, y - 2); yy <= Math.min(lim - 1, y + 3, Hh - 2); yy++){ const g = P[yy - 1] - P[yy + 1]; if (g > bg){ bg = g; by = yy; } }
@@ -1587,11 +1593,14 @@ function skyFit(img, H, A, base){
     while (yB > yA && pixEl(x, yB, 0, 0, ty0, cr0, sr0) < eLo) yB -= 4;
     yA = Math.max(yA - 4, 0); yB = Math.min(yB + 4, Hh - 1);
     // 1. the clear edge: sky to land or sea, on brightness plus blueness (white cloud over blue sky is no step)
-    const sig = noise(prof, yA - 40, Math.max(yA, 41)), y1 = findStep(prof, cs, yA, yB, Math.max(12, 3*sig, 0.06*skyLvl), null);
+    // the patch just above an edge must look like sky: bright for this scene and not yellow (a lamp, a wall)
+    const skyOK = y => { let l = 0, bl = 0, n = 0; for (let yy = Math.max(0, y - REF); yy < y; yy++) for (let xx = x - 1; xx <= x + 1; xx++){ const i = yy*W + xx; l += Lm[i]; bl += Bl[i]; n++; }
+      return n && l/n >= 0.7*skyLvl && bl/n > -30; };
+    const sig = noise(prof, yA - 40, Math.max(yA, 41)), y1 = findStep(prof, cs, yA, yB, Math.max(12, 3*sig, 0.06*skyLvl), null, skyOK);
     if (y1 < 0) continue;
     // 2. a faint range standing on that edge: distant mountains are bluish and only a few levels darker than the sky,
     //    so look on brightness alone, just above the edge, and require it to stay darker all the way down to the edge
-    const sigL = noise(lp, y1 - FAINT - 30, y1 - FAINT), y2 = findStep(lp, cl, Math.max(REF, y1 - FAINT), y1 - 2, Math.max(3, 2.5*sigL), y1);
+    const sigL = noise(lp, y1 - FAINT - 30, y1 - FAINT), y2 = findStep(lp, cl, Math.max(REF, y1 - FAINT), y1 - 2, Math.max(3, 2.5*sigL), y1, skyOK);
     rows[x] = y2 >= 0 ? y2 : y1;
     if (rows[x] <= 2) rows[x] = -1;                                        // land from the very top: no sky in this column
   }
@@ -1698,7 +1707,10 @@ function skyFit(img, H, A, base){
   else if (inlFrac < 0.4) why = "most of the skyline is trees or buildings";
   // while tracking, pitch and roll are already known; a fit that only works by tilting the view a lot has
   // matched something else (in tests: cloud bases above the land, at the wrong heading)
-  else if (TRK && (Math.abs(q[1]) > 1 || Math.abs(q[2]) > 2)) why = `fit needs a ${Math.abs(q[1]) > 1 ? "pitch" : "roll"} change of ${Math.abs(Math.abs(q[1]) > 1 ? q[1] : q[2]).toFixed(1)}°, not trusted`;
+  // the phone's own tilt sensing is good to a degree or two, so even without a lock a fit that needs a big tilt
+  // correction is suspect (in tests: an evening frame in town that fitted only with 5.5 deg of pitch)
+  else if (Math.abs(q[1]) > (TRK ? 1 : 3) || Math.abs(q[2]) > (TRK ? 2 : 4)){ const pe = Math.abs(q[1]) > (TRK ? 1 : 3);
+    why = `fit needs a ${pe ? "pitch" : "roll"} change of ${Math.abs(pe ? q[1] : q[2]).toFixed(1)}°, not trusted`; }
   // heading undecided but the edge itself fits well (e.g. open sea horizon): pitch and roll can still be used
   const partial = !!why && /too flat|fits almost as well/.test(why) && inl.length >= 40 && best.mad < 0.2 && inlFrac >= 0.5;
   // overlay: detected skyline points and the fitted terrain skyline (forward projection)
@@ -1969,7 +1981,7 @@ function snapshot(full){
   let demHere = null; try { demHere = S.pos ? r3(elevAt(S.pos[0], S.pos[1])) : null; } catch(e){}
   const f = S.lastFix;
   return {
-    app:"sightline", build:"2026-11-07 far-horizon", at:new Date().toISOString(), tNow:Math.round(performance.now()),
+    app:"sightline", build:"2026-11-07 indoor-sky", at:new Date().toISOString(), tNow:Math.round(performance.now()),
     cameraFocus:S.camFocus || null,
     compassQuality:{ level:CQ.level, swingDeg:CQ.swing === null ? null : r3(CQ.swing), spanDeg:CQ.span, advice:compassAdvice().text },
     env:{ ua:navigator.userAgent, secure:isSecureContext, screen:`${screen.width}x${screen.height}@${devicePixelRatio}`,

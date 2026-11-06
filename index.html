@@ -139,6 +139,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <h2>Skyline lock</h2>
   <div class="row"><label for="skyOn">Align heading, tilt and height to the skyline</label><input id="skyOn" type="checkbox"></div>
   <div class="row"><label for="skyShow">Show the detected skyline</label><input id="skyShow" type="checkbox" checked></div>
+  <div class="row"><label for="skyRange">Skyline distance (how far away mountains can be matched)</label><select id="skyRange"><option value="25000">25 km</option><option value="80000">80 km</option><option value="150000">150 km</option><option value="200000" selected>200 km</option><option value="300000">300 km</option></select></div>
   <div class="row"><span>Current fix</span><span id="skyNow" class="mono" style="text-align:right">—</span></div>
   <div class="row"><button id="btnSkyReset">Reset skyline fix</button></div>
   <p class="note">Needs the camera and hills on the skyline. About once a second the app finds the sky edge in the camera image and fits the terrain horizon (out to 25 km) to it. Heading is corrected only when the skyline has shape; height only when ridges at different distances are in view. Trees, buildings and cloud on the skyline can mislead it: the cyan line is where the fitted terrain horizon falls, the red dots are the edge it found.</p>
@@ -1321,7 +1322,7 @@ function statusItems(){
     const L = SKY.last, fresh = L && Date.now() - L.at < 4000;
     if (!camStream) it.push(["Skyline", "off", "Needs the camera"]);
     else if (!S.pos) it.push(["Skyline", "off", "Waiting for location"]);
-    else if (!SKY.H) it.push(["Skyline", "busy", SKY.Hbusy ? "Computing the 25 km horizon" : "Starting"]);
+    else if (!SKY.H) it.push(["Skyline", "busy", SKY.Hbusy ? `Computing the ${(skyRangeM()/1000).toFixed(0)} km horizon` : "Starting"]);
     else if (fresh && L.ok && L.used) it.push(["Skyline", "ok", skyText()]);
     else if (fresh && L.ok && L.pendingAz) it.push(["Skyline", "busy", `Found heading ${L.daz >= 0 ? "+" : ""}${L.daz.toFixed(0)}° from current, confirming with the next frame`]);
     else if (fresh && L.ok) it.push(["Skyline", "busy", "Fit disagrees with the last fix, checking"]);
@@ -1424,36 +1425,85 @@ $("btnZeroGps").onclick = () => {
    height error moves each ridge by about dz/distance, so near and far ridges together separate pitch from height. */
 const FAR_Z = 12, FAR_R = 25000;
 const SKY_INIT = () => ({ n:0, az:0, vaz:36, el:0, vel:4, roll:0, vroll:4, hRel:null, vh:900, t:0 });
-const SKY = { H:null, Hbusy:false, last:null, busy:false, rejects:0, f:SKY_INIT(), cv:null };
+const SKY = { H:null, Hfar:null, Hbusy:false, last:null, busy:false, rejects:0, f:SKY_INIT(), cv:null };
 function skyOn(){ return $("skyOn").checked; }
 function skyAz(){ return skyOn() && SKY.f.n ? SKY.f.az : 0; }
 function skyEl(){ return skyOn() && SKY.f.n ? SKY.f.el : 0; }
 function skyRoll(){ return skyOn() && SKY.f.n ? SKY.f.roll : 0; }
 
-/* far horizon: for each 0.25 deg bearing, distance and terrain height of the ridge that forms the skyline */
+/* Terrain horizon, for each 0.25 deg bearing: the distance and terrain height of the ridge that forms the skyline.
+   Near ring (to 25 km, zoom 12) is rebuilt every 30 m. Far ring (25 km to the skyline-distance setting, zoom 9,
+   ~150 m pixels) is costly, so it is rebuilt every 2 km; in between, its ridge points are re-projected from the
+   current position, which is accurate while the move is small next to the ridge distance. */
+const FAR2_Z = 9, FAR2_MOVE = 2000;
+function skyRangeM(){ return +(($("skyRange") || {}).value) || 200000; }
+function preloadRing(lat, lon, R, z){           // only the tiles that touch the circle
+  const n = 2**z, [cx, cy] = tileXY(lat, lon, z), tileM = 2*Math.PI*RE*Math.cos(lat*D2R)/n, r = Math.ceil(R/tileM) + 1, ps = [];
+  for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++){
+    const tx = Math.floor(cx) + dx, ty = Math.floor(cy) + dy;
+    const nx = Math.max(tx, Math.min(cx, tx + 1)), ny = Math.max(ty, Math.min(cy, ty + 1));     // nearest point of the tile
+    if (Math.hypot(nx - cx, ny - cy)*tileM <= R) ps.push(loadTile(z, tx, ty).p);
+  }
+  return Promise.all(ps);
+}
+/* scan 1440 bearings from obs between distances in ds; returns per-bearing best ridge { dist, elev } (null if none) */
+async function ringScan(obs, h0, k, ds, z, NA){
+  const curv = (1 - k)/(2*RE), cosL = Math.cos(obs[0]*D2R), dist = new Array(NA), elev = new Array(NA); let missing = 0, tY = performance.now();
+  for (let a = 0; a < NA; a++){
+    const az = a*2*Math.PI/NA, se = Math.sin(az), cn = Math.cos(az); let best = -Infinity, bd = null, bt = null;
+    for (const d of ds){
+      const T = elevAtZ(obs[0] + d*cn/RE*R2D, obs[1] + d*se/(RE*cosL)*R2D, z);
+      if (T === null){ missing++; continue; }
+      const sl = (T - h0 - curv*d*d)/d; if (sl > best){ best = sl; bd = d; bt = T; }
+    }
+    dist[a] = bd === null ? null : Math.round(bd); elev[a] = bt === null ? null : Math.round(bt*10)/10;
+    if (performance.now() - tY > 25){ await new Promise(r => setTimeout(r, 0)); tY = performance.now(); }   // keep the screen smooth
+  }
+  return { dist, elev, missing };
+}
+/* merge far ridge points (lat, lon, elev from an earlier position) into the near ring as seen from obs, height h0 */
+function mergeFar(near, far, obs, h0, k){
+  const NA = near.NA, curv = (1 - k)/(2*RE), cosL = Math.cos(obs[0]*D2R), dist = near.dist.slice(), elev = near.elev.slice();
+  const ang = i => dist[i] == null ? -Infinity : Math.atan2(elev[i] - h0 - curv*dist[i]*dist[i], dist[i]);
+  const fa = new Float64Array(NA).fill(-Infinity), fd = new Array(NA).fill(null), fe = new Array(NA).fill(null);
+  for (const p of far.pts){
+    if (!p) continue;
+    const dn = (p[0] - obs[0])*D2R*RE, de = (p[1] - obs[1])*D2R*RE*cosL, d = Math.hypot(dn, de); if (d < 1000) continue;
+    const a = Math.atan2(p[2] - h0 - curv*d*d, d); let i = Math.round(((Math.atan2(de, dn)*R2D + 360) % 360)/(360/NA)) % NA;
+    if (a > fa[i]){ fa[i] = a; fd[i] = Math.round(d); fe[i] = p[2]; }
+  }
+  for (let i = 0; i < NA; i++){                     // a bearing that got no point after the move: borrow a neighbour
+    if (fd[i] === null){ const l = (i + NA - 1) % NA, r = (i + 1) % NA, j = fa[l] >= fa[r] ? l : r; if (fd[j] !== null && fd[(j === l ? r : l)] !== null){ fa[i] = fa[j]; fd[i] = fd[j]; fe[i] = fe[j]; } }
+    if (fd[i] !== null && fa[i] > ang(i)){ dist[i] = fd[i]; elev[i] = fe[i]; }
+  }
+  return { dist, elev };
+}
 async function farHorizon(obs, k){
-  if (SKY.H && distBear(SKY.H.obs, obs)[0] < 30 && SKY.H.k === k && !SKY.H.missing) return SKY.H;
+  const R2 = skyRangeM();
+  if (SKY.H && distBear(SKY.H.obs, obs)[0] < 30 && SKY.H.k === k && !SKY.H.missing && SKY.H.R === Math.max(FAR_R, R2)) return SKY.H;
   if (SKY.Hbusy) return SKY.H && distBear(SKY.H.obs, obs)[0] < 200 ? SKY.H : null;
   SKY.Hbusy = true; updateChips();
   try {
     await preload(obs[0], obs[1], FAR_R + 500, FAR_Z);
-    const g = elevAtZ(obs[0], obs[1], FAR_Z), hb = baseHeight(), h0 = hb !== null ? hb : (g || 0) + (+$("eye").value || 0);
-    const NA = 1440, ds = hzDistances(FAR_R), curv = (1 - k)/(2*RE), cosL = Math.cos(obs[0]*D2R);
-    const dist = new Array(NA), elev = new Array(NA); let missing = 0;
-    for (let a = 0; a < NA; a++){
-      const az = a*2*Math.PI/NA, se = Math.sin(az), cn = Math.cos(az); let best = -Infinity, bd = null, bt = null;
-      for (const d of ds){
-        const T = elevAtZ(obs[0] + d*cn/RE*R2D, obs[1] + d*se/(RE*cosL)*R2D, FAR_Z);
-        if (T === null){ missing++; continue; }
-        const sl = (T - h0 - curv*d*d)/d; if (sl > best){ best = sl; bd = d; bt = T; }
+    const g = elevAtZ(obs[0], obs[1], FAR_Z), hb = baseHeight(), h0 = hb !== null ? hb : (g || 0) + (+$("eye").value || 0), NA = 1440;
+    const near = await ringScan(obs, h0, k, hzDistances(FAR_R), FAR_Z, NA);
+    let dist = near.dist, elev = near.elev, missing = near.missing;
+    if (R2 > FAR_R){
+      let F = SKY.Hfar;
+      if (!F || F.R !== R2 || F.k !== k || distBear(F.obs, obs)[0] > FAR2_MOVE || F.missing){
+        await preloadRing(obs[0], obs[1], R2, FAR2_Z);
+        const ds = []; for (let d = FAR_R; d <= R2; d += Math.max(120, d*0.002)) ds.push(d);
+        const r = await ringScan(obs, h0, k, ds, FAR2_Z, NA), cosL = Math.cos(obs[0]*D2R);
+        const pts = r.dist.map((d, a) => d == null ? null : [obs[0] + d*Math.cos(a*2*Math.PI/NA)/RE*R2D, obs[1] + d*Math.sin(a*2*Math.PI/NA)/(RE*cosL)*R2D, r.elev[a]]);
+        F = SKY.Hfar = { obs:obs.slice(), R:R2, k, pts, missing:r.missing > ds.length*NA*0.02 ? r.missing : 0 };
       }
-      dist[a] = bd === null ? null : Math.round(bd); elev[a] = bt === null ? null : Math.round(bt*10)/10;
-      if (a % 120 === 119) await new Promise(r => setTimeout(r, 0));
+      const m = mergeFar({ NA, dist, elev }, F, obs, h0, k); dist = m.dist; elev = m.elev;
     }
-    SKY.H = { obs:obs.slice(), k, h0, R:FAR_R, NA, dist, elev, missing, at:new Date().toISOString() };
+    SKY.H = { obs:obs.slice(), k, h0, R:Math.max(FAR_R, R2), NA, dist, elev, missing, at:new Date().toISOString() };
   } finally { SKY.Hbusy = false; updateChips(); }
   return SKY.H;
 }
+$("skyRange").addEventListener("change", () => { SKY.Hfar = null; });
 
 function solveN(M, v){                                   // Gaussian elimination with partial pivoting; M is n x n
   const n = v.length, A = M.map((r, i) => r.concat([v[i]]));
@@ -1486,23 +1536,69 @@ function skyFit(img, H, A, base){
   const topS = []; for (let y = 0; y < Hh/5; y += 2) for (let x = 0; x < W; x += 3) topS.push(Lm[y*W + x]);
   topS.sort((p, q) => p - q); const skyLvl = topS[topS.length >> 1];
   if (!(skyLvl > 110)) return out({ why:"sky too dark to find the skyline" });
-  const thr = Math.min(skyLvl - 45, 0.62*skyLvl), RUN = 6;
-  // skyline row per column
-  const rows = new Int32Array(W).fill(-1);
-  for (let x = 0; x < W; x++){
-    let run = 0;
-    for (let y = 0; y < Hh; y++){
-      const i = y*W + x;
-      if (Lm[i] < thr && Bl[i] < 25){ if (++run === RUN){ rows[x] = y - RUN + 1; break; } } else run = 0;
-    }
-    if (rows[x] <= 2) rows[x] = -1;                                   // land from the very top: no sky in this column
-  }
   const f = (Math.max(W, Hh)/2)/Math.tan(base.fov*D2R/2), th = base.screenAngle*D2R, ct = Math.cos(th), st = Math.sin(th);
-  const cols = []; for (let x = 0; x < W; x += 2) if (rows[x] >= 0) cols.push(x);
+  const AX = A.X, AY = A.Y, AZ = A.Z;
+  // elevation angle (deg) of pixel (x, y) through the current pose, with pitch/roll offsets q1, q2
+  const pixEl = (px, py, q1, q2, ty, cr, sr) => {
+    const X0 = px + 0.5 - W/2, Y0 = py + 0.5 - Hh/2, Xr = X0*cr + Y0*sr, Yr = -X0*sr + Y0*cr;
+    const u = Xr/f, w = -(Yr - ty)/f, x = u*ct - w*st, y = u*st + w*ct;
+    const ve = x*AX[0] + y*AY[0] - AZ[0], vn = x*AX[1] + y*AY[1] - AZ[1], vu = x*AX[2] + y*AY[2] - AZ[2];
+    return Math.asin(vu/Math.hypot(ve, vn, vu))*R2D;
+  };
+  // Only look for the skyline where terrain can put it: between the lowest and highest terrain horizon angle
+  // (any bearing, since heading is searched over 360 deg), widened by how wrong pitch and roll may be.
+  const TRK = !!base.trackWin;                 // tracking: pitch and roll already known, heading within the window
+  let aLo = Infinity, aHi = -Infinity;
+  { const curv0 = (1 - base.k)/(2*RE); for (let i = 0; i < H.NA; i++){ const d = H.dist[i]; if (d == null) continue;
+      const a = Math.atan2(H.elev[i] - base.h0 - curv0*d*d, d)*R2D; if (a < aLo) aLo = a; if (a > aHi) aHi = a; } }
+  if (!(aHi > -90)) return out({ why:"no terrain horizon" });
+  const eLo = aLo - 3, eHi = aHi + 3;
+  // skyline row per column, in two passes (below)
+  // Contrast is judged against the sky just above the step, so faint distant ranges count as long as the
+  // step is crisp; soft cloud edges spread over many rows and fail the sharpness test.
+  const rows = new Int32Array(W).fill(-1), REF = 10, RUN = 5, PER = 14, FAINT = Math.round(1.6*D2R*f);
+  const prof = new Float32Array(Hh), cs = new Float64Array(Hh + 1), lp = new Float32Array(Hh), cl = new Float64Array(Hh + 1);
+  const ty0 = f*Math.tan(base.el*D2R), cr0 = Math.cos(base.roll*D2R), sr0 = Math.sin(base.roll*D2R);
+  const noise = (P, a, b) => { let z = 0, n = 0; for (let y = Math.max(1, a); y < b; y++){ z += Math.abs(P[y] - P[y - 1]); n++; } return n ? 1.25*z/n : 2; };
+  // top-most step in P (prefix sums C) between rows a and b with contrast >= cMin; -1 if none
+  const findStep = (P, C, a, b, cMin, edge) => {
+    // edge (faint pass): row of the clear edge below; the faint range must stay darker down to it, and the
+    // "below" windows are cut short there so the clear edge itself never counts as the faint step
+    const mean = (u, v) => (C[v] - C[u])/(v - u);
+    for (let y = Math.max(a, REF); y < b && y + RUN + PER < Hh; y++){
+      const lim = edge == null ? Hh : edge, e5 = Math.min(y + RUN, lim), e3 = Math.min(y + 3, lim);
+      if (e3 - y < 2) break;
+      // contrast against the sky extrapolated along its own gradient, so a sky that darkens smoothly is no step
+      const s1 = mean(y - REF, y - REF/2), s2 = mean(y - REF/2, y), sky = 2*s2 - s1, below = mean(y, e5), c = sky - below;
+      if (c < cMin || s2 - below < cMin) continue;
+      if (mean(y - 3, y) - mean(y, e3) < 0.45*c) continue;                 // the change is spread out: soft cloud edge
+      if (edge == null){ if (sky - mean(y + RUN, y + RUN + PER) < 0.5*c) continue; }   // brightens again right below: cloud band
+      else { let ok = true; for (let yy = e5; yy + 2 <= edge; yy += 2) if (s2 - mean(yy, yy + 2) < 0.5*c){ ok = false; break; } if (!ok) continue; }
+      let by = y, bg = -Infinity; for (let yy = Math.max(1, y - 2); yy <= Math.min(lim - 1, y + 3, Hh - 2); yy++){ const g = P[yy - 1] - P[yy + 1]; if (g > bg){ bg = g; by = yy; } }
+      return by;
+    }
+    return -1;
+  };
+  for (let x = 1; x < W - 1; x += 2){
+    for (let y = 0; y < Hh; y++){ const i = y*W + x, l = (Lm[i - 1] + Lm[i] + Lm[i + 1])/3; lp[y] = l; prof[y] = l + (Bl[i - 1] + Bl[i] + Bl[i + 1])/3; cs[y + 1] = cs[y] + prof[y]; cl[y + 1] = cl[y] + l; }
+    // rows of the band in this column (elevation falls as y grows)
+    let yA = 0, yB = Hh - 1;
+    while (yA < Hh - 1 && pixEl(x, yA, 0, 0, ty0, cr0, sr0) > eHi) yA += 4;
+    while (yB > yA && pixEl(x, yB, 0, 0, ty0, cr0, sr0) < eLo) yB -= 4;
+    yA = Math.max(yA - 4, 0); yB = Math.min(yB + 4, Hh - 1);
+    // 1. the clear edge: sky to land or sea, on brightness plus blueness (white cloud over blue sky is no step)
+    const sig = noise(prof, yA - 40, Math.max(yA, 41)), y1 = findStep(prof, cs, yA, yB, Math.max(12, 3*sig, 0.06*skyLvl), null);
+    if (y1 < 0) continue;
+    // 2. a faint range standing on that edge: distant mountains are bluish and only a few levels darker than the sky,
+    //    so look on brightness alone, just above the edge, and require it to stay darker all the way down to the edge
+    const sigL = noise(lp, y1 - FAINT - 30, y1 - FAINT), y2 = findStep(lp, cl, Math.max(REF, y1 - FAINT), y1 - 2, Math.max(3, 2.5*sigL), y1);
+    rows[x] = y2 >= 0 ? y2 : y1;
+    if (rows[x] <= 2) rows[x] = -1;                                        // land from the very top: no sky in this column
+  }
+  const cols = []; for (let x = 1; x < W - 1; x += 2) if (rows[x] >= 0) cols.push(x);
   const n0 = Math.ceil(W/2);
   if (cols.length < 40) return out({ why:"no sky-to-land edge found", n0, n:cols.length });
   // camera rays for the skyline pixels, given pitch/roll offsets (q1, q2); returns bearing (deg, before heading) and elevation (deg)
-  const AX = A.X, AY = A.Y, AZ = A.Z;
   const raysFor = (q1, q2) => {
     const el = (base.el + q1)*D2R, rr = (base.roll + q2)*D2R, cr = Math.cos(rr), sr = Math.sin(rr), ty = f*Math.tan(el);
     const B = new Float64Array(cols.length), E = new Float64Array(cols.length), U = new Float64Array(cols.length);
@@ -1534,20 +1630,25 @@ function skyFit(img, H, A, base){
     }
     return n;
   };
+  const TAU2 = 0.3*0.3;
   const madAt = (R, ang, off) => {
-    const n = resid(R, ang, off, tmp); if (n < 30) return { mad:Infinity, med:0, n };
-    const r = tmp.slice(0, n), med = median(tmp, n); for (let k = 0; k < n; k++) tmp[k] = Math.abs(r[k] - med);
-    return { mad:median(tmp, n), med, n };
+    const n = resid(R, ang, off, tmp); if (n < 30) return { mad:Infinity, med:0, n, tls:Infinity };
+    const r = tmp.slice(0, n), med = median(tmp, n); let t = 0; for (let k = 0; k < n; k++){ const e = Math.abs(r[k] - med); tmp[k] = e; t += Math.min(e*e, TAU2); }
+    // score: truncated squares, so every column that fits counts (a few mountain columns that fit beat a
+    // heading where only the flat sea-horizon columns fit, which the median would not notice)
+    return { mad:median(tmp, n), med, n, tls:t/n };
   };
   // 1. coarse 360 deg heading search at the current pitch, roll and height
   const R0 = raysFor(0, 0), ang0 = angFor(0), coarse = [];
-  for (let off = -180; off < 180; off += 0.5) coarse.push({ off, ...madAt(R0, ang0, off) });
-  let best = coarse.reduce((p, q) => q.mad < p.mad ? q : p);
+  // while tracking (a recent fix, carried by the gyro), search only near the current heading
+  const TW = base.trackWin || 180, MINR = base.trackWin ? 3 : 10;
+  for (let off = -TW; off < TW; off += 0.5) coarse.push({ off, ...madAt(R0, ang0, off) });
+  let best = coarse.reduce((p, q) => q.tls < p.tls ? q : p);
   let off = best.off;
-  for (let o = best.off - 0.6; o <= best.off + 0.6; o += 0.05){ const r = madAt(R0, ang0, o); if (r.mad < best.mad){ best = { off:o, ...r }; off = o; } }
+  for (let o = best.off - 0.6; o <= best.off + 0.6; o += 0.05){ const r = madAt(R0, ang0, o); if (r.tls < best.tls){ best = { off:o, ...r }; off = o; } }
   const wrap = a => ((a + 540) % 360) - 180;
-  const rival = coarse.filter(c => Math.abs(wrap(c.off - off)) >= 10).reduce((p, q) => q.mad < p.mad ? q : p, { mad:Infinity, off:null });
-  const ratio = best.mad/rival.mad;
+  const rival = coarse.filter(c => Math.abs(wrap(c.off - off)) >= MINR).reduce((p, q) => q.tls < p.tls ? q : p, { tls:Infinity, off:null });
+  const ratio = best.tls/rival.tls;
   // 2. Gauss-Newton on the inliers for heading, pitch, roll, height
   const inl = []; { const n = resid(R0, ang0, off, tmp); for (let k = 0, j = 0; k < R0.B.length; k++){ let i = Math.round((R0.B[k] + base.rot + off)/step) % NA; if (i < 0) i += NA; if (ang0[i] === ang0[i]){ if (Math.abs(tmp[j] - best.med) < Math.max(0.3, 2.5*best.mad)) inl.push(k); j++; } } }
   const angInterp = (ang, b) => { const x = (((b % 360) + 360) % 360)/step, i = Math.floor(x), fr = x - i, a0 = ang[i % NA], a1 = ang[(i + 1) % NA]; return a0 === a0 && a1 === a1 ? a0 + (a1 - a0)*fr : NaN; };
@@ -1557,7 +1658,7 @@ function skyFit(img, H, A, base){
     return r;
   };
   let q = [off, 0, 0, 0], C = null, rms = null;
-  const PRIOR = [0, 1/25, 1/9, 1/3600], DQ = [0.05, 0.05, 0.05, 1];
+  const PRIOR = TRK ? [0, 1, 1/2.25, 1/3600] : [0, 1/25, 1/9, 1/3600], DQ = [0.05, 0.05, 0.05, 1];
   if (inl.length >= 30){
     for (let it = 0; it < 6; it++){
       const r0 = resVec(q), J = [0, 1, 2, 3].map(j => { const qq = q.slice(); qq[j] += DQ[j]; const r1 = resVec(qq); return r1.map((v, k) => (v - r0[k])/DQ[j]); });
@@ -1571,6 +1672,17 @@ function skyFit(img, H, A, base){
     }
     const r = resVec(q); rms = Math.sqrt(r.reduce((a, v) => a + Math.min(v*v, 0.25), 0)/r.length);
   }
+  // judge the competition again at the refined pitch, roll and height: a pose error can make the wrong heading
+  // look as good as the right one in the first pass
+  let ratioR = ratio, rivalR = rival.off;
+  if (C){
+    const R1 = raysFor(q[1], q[2]), ang1 = angFor(q[3]), sc = [];
+    for (let o = -TW; o < TW; o += 0.5) sc.push({ off:o, ...madAt(R1, ang1, o) });
+    const near = o => { let b2 = { tls:Infinity }; for (let d = -0.6; d <= 0.6; d += 0.05){ const r = madAt(R1, ang1, o + d); if (r.tls < b2.tls) b2 = { off:o + d, ...r }; } return b2; };
+    const bR = near(q[0]), rv = sc.filter(c => Math.abs(wrap(c.off - bR.off)) >= MINR).reduce((p, c) => c.tls < p.tls ? c : p, { tls:Infinity, off:null });
+    const rR = rv.off === null ? rv : near(rv.off);
+    if (bR.tls < Infinity){ ratioR = bR.tls/rR.tls; rivalR = rR.off; best.mad = Math.min(best.mad, bR.mad); }
+  }
   const s2 = rms === null ? 1 : Math.max(rms*rms, 0.01);
   const sd = C ? { az:Math.max(0.1, Math.sqrt(s2*C[0][0])), el:Math.sqrt(s2*C[1][1]), roll:Math.sqrt(s2*C[2][2]), dz:Math.sqrt(s2*C[3][3]) } : { az:99, el:99, roll:99, dz:999 };
   // relief of the terrain horizon across the view (flat skylines cannot fix heading)
@@ -1582,9 +1694,13 @@ function skyFit(img, H, A, base){
   if (inl.length < 40) why = "too few skyline columns match the terrain";
   else if (relief < 0.12) why = "skyline too flat to fix heading";
   else if (best.mad > 0.35) why = `skyline does not match the terrain well (${best.mad.toFixed(2)}° scatter)`;
-  else if (ratio > 0.75) why = `another heading ${rival.off === null ? "" : (wrap(rival.off - off) > 0 ? "+" : "") + wrap(rival.off - off).toFixed(0) + "° away "}fits almost as well`;
+  else if (ratioR > 0.75) why = `another heading ${rivalR === null ? "" : (wrap(rivalR - q[0]) > 0 ? "+" : "") + wrap(rivalR - q[0]).toFixed(0) + "° away "}fits almost as well`;
   else if (inlFrac < 0.4) why = "most of the skyline is trees or buildings";
-  const partial = why === "skyline too flat to fix heading" && inl.length >= 40 && best.mad < 0.2;
+  // while tracking, pitch and roll are already known; a fit that only works by tilting the view a lot has
+  // matched something else (in tests: cloud bases above the land, at the wrong heading)
+  else if (TRK && (Math.abs(q[1]) > 1 || Math.abs(q[2]) > 2)) why = `fit needs a ${Math.abs(q[1]) > 1 ? "pitch" : "roll"} change of ${Math.abs(Math.abs(q[1]) > 1 ? q[1] : q[2]).toFixed(1)}°, not trusted`;
+  // heading undecided but the edge itself fits well (e.g. open sea horizon): pitch and roll can still be used
+  const partial = !!why && /too flat|fits almost as well/.test(why) && inl.length >= 40 && best.mad < 0.2 && inlFrac >= 0.5;
   // overlay: detected skyline points and the fitted terrain skyline (forward projection)
   const pts = []; for (let k = 0; k < cols.length; k += 2) pts.push([cols[k] + 0.5, rows[cols[k]] + 0.5]);
   const pred = [], el = (base.el + q[1])*D2R, rr = (base.roll + q[2])*D2R, cr = Math.cos(rr), sr = Math.sin(rr), ty = f*Math.tan(el);
@@ -1598,7 +1714,7 @@ function skyFit(img, H, A, base){
     if (px >= 0 && px <= W) pred.push([Math.round(px*10)/10, Math.round(py*10)/10]);
   }
   pred.sort((p, s3) => p[0] - s3[0]);
-  return out({ ok:!why, partial, why, daz:wrap(q[0]), del:q[1], droll:q[2], dz:q[3], sd, margin:1 - ratio, ratio, rivalOff:rival.off === null ? null : wrap(rival.off - off),
+  return out({ ok:!why, partial, why, daz:wrap(q[0]), del:q[1], droll:q[2], dz:q[3], sd, margin:1 - ratioR, ratio:ratioR, ratio0:ratio, rivalOff:rivalR === null ? null : wrap(rivalR - q[0]),
     mad:best.mad, relief, n:inl.length, n0, coverage, inlierFrac:inlFrac, rmsPx:rms === null ? null : rms*f*D2R, score:-best.mad, skyLvl, pts, pred });
 }
 
@@ -1633,6 +1749,7 @@ function skyUpdate(res){
   SKY.rejects = rejected && !used ? SKY.rejects + 1 : 0;
   res.used = used; res.rejected = rejected;
   if (used){ F.n++; if ($("lockNorth").checked && !$("sim").checked) S.northLocked = true; }
+  if (res.ok && used && !res.pendingAz) SKY.lastUsedAt = Date.now();
 }
 
 /* run the fit in a worker so the screen never stalls; same function, its source shipped as a blob */
@@ -1659,7 +1776,8 @@ async function skyStep(){
     const c = SKY.cv || (SKY.cv = document.createElement("canvas")); c.width = w; c.height = h;
     const cx = c.getContext("2d", { willReadFrequently:true }); cx.drawImage(v, 0, 0, w, h);
     const img = cx.getImageData(0, 0, w, h), h0 = observerHeight(); if (h0 === null) return;
-    const base = { rot:A.rot, el:S.cal.el + skyEl(), roll:skyRoll(), h0, k, fov:+$("fov").value || 66,
+    const F = SKY.f, tracking = F.n && SKY.lastUsedAt && Date.now() - SKY.lastUsedAt < 30000 && Math.sqrt(F.vaz) < 2;
+    const base = { rot:A.rot, el:S.cal.el + skyEl(), roll:skyRoll(), h0, k, fov:+$("fov").value || 61, trackWin:tracking ? 15 : 0,
       screenAngle:(screen.orientation && screen.orientation.angle) || window.orientation || 0 };
     const res = SKY_W ? await SKY_W.fit(img, H, { X:A.X.slice(), Y:A.Y.slice(), Z:A.Z.slice() }, base) : skyFit(img, H, A, base);
     res.at = Date.now(); res.base = base; res.worker = !!SKY_W;
@@ -1702,7 +1820,7 @@ async function capRefreshCount(){
   try { CAP.count = await capTx("readonly", st => st.count()) || 0; } catch(e){ CAP.count = 0; }
   $("capCount").textContent = String(CAP.count);
 }
-/* Terrain horizon to 25 km: for each of 1440 bearings (0.25 deg, true north), the highest elevation angle,
+/* Terrain horizon (to the skyline-distance setting): for each of 1440 bearings (0.25 deg, true north), the highest elevation angle,
    the distance of the ridge that forms it and its terrain height. Angle includes curvature and refraction for h0. */
 async function captureHorizon(obs, h0, k){
   const H = await farHorizon(obs, k); if (!H) return null;
@@ -1871,7 +1989,7 @@ function snapshot(full){
     lastFix:f && { az:r3(f.az), el:r3(f.el), h0:r3(f.h0), obs:f.obs, missing:f.missing,
       hit:f.hit && { lat:r3(f.hit.lat*100)/100, lon:r3(f.hit.lon*100)/100, d:r3(f.hit.d), elev:r3(f.hit.elev) },
       sky:f.sky && { d:r3(f.sky.d), ang:r3(f.sky.ang), elev:r3(f.sky.elev) } },
-    skyline:{ on:skyOn(), filter:{ ...SKY.f }, last:SKY.last && { ok:SKY.last.ok, why:SKY.last.why, daz:SKY.last.daz, del:SKY.last.del, droll:SKY.last.droll, dz:SKY.last.dz, sd:SKY.last.sd, margin:SKY.last.margin, relief:SKY.last.relief, n:SKY.last.n, n0:SKY.last.n0, ms:SKY.last.ms, used:SKY.last.used }, farHorizon:SKY.H && { obs:SKY.H.obs, at:SKY.H.at, missing:SKY.H.missing } },
+    skyline:{ on:skyOn(), filter:{ ...SKY.f }, last:SKY.last && { ok:SKY.last.ok, why:SKY.last.why, daz:SKY.last.daz, del:SKY.last.del, droll:SKY.last.droll, dz:SKY.last.dz, sd:SKY.last.sd, margin:SKY.last.margin, relief:SKY.last.relief, n:SKY.last.n, n0:SKY.last.n0, ms:SKY.last.ms, used:SKY.last.used }, farHorizon:SKY.H && { obs:SKY.H.obs, at:SKY.H.at, missing:SKY.H.missing, R:SKY.H.R }, farRing:SKY.Hfar && { obs:SKY.Hfar.obs, R:SKY.Hfar.R, missing:SKY.Hfar.missing }, trackingSince:SKY.lastUsedAt || null },
     locked:S.locked, settings, storage:{ ...STORE, savedNow:saved, origin:location.origin, path:location.pathname }, counts:DBG.counts,
     gyroResets:DBG.resets.slice(), offsetLog:full ? DBG.offset.slice() : DBG.offset.slice(-30),
     raw:full ? { orientation:DBG.orient.slice(), orientationAbsolute:DBG.abs.slice(), gps:DBG.gps.slice() }
@@ -1889,7 +2007,7 @@ $("btnDbgCopy").onclick = () => {
 };
 
 /* persist settings in this browser */
-const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","topoOn","topoInt","topoRange","layer","skyOn","skyShow","focusMode","mapMarks"];
+const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","decl","lockNorth","camOn","arOn","arRad","fov","arHidden","topoOn","topoInt","topoRange","layer","skyOn","skyShow","skyRange","focusMode","mapMarks"];
 let saved = {};
 const STORE = { raw:null, readErr:null, writeErr:null, writes:0, restored:[], mismatched:[] };
 try { STORE.raw = localStorage.getItem("sightline.settings"); saved = JSON.parse(STORE.raw) || {}; } catch(e){ STORE.readErr = String(e); }

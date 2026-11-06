@@ -149,7 +149,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div class="row"><span>Focus support</span><span id="focusInfo" class="mono" style="text-align:right">—</span></div>
   <div class="row"><label for="arOn">AR street overlay</label><input id="arOn" type="checkbox"></div>
   <div class="row"><label for="arRad">Street radius (m)</label><select id="arRad"><option>800</option><option selected>1500</option><option>3000</option></select></div>
-  <div class="row"><label for="fov">Camera FOV, long side (°)</label><input id="fov" type="number" step="1" value="66"></div>
+  <div class="row"><label for="fov">Camera FOV, long side (°)</label><input id="fov" type="number" step="1" value="61"></div>
   <div class="row"><label for="arHidden">Also show streets hidden by terrain (faint)</label><input id="arHidden" type="checkbox"></div>
   <div class="row"><label for="topoOn">AR contour lines</label><input id="topoOn" type="checkbox"></div>
   <div class="row"><label for="topoInt">Contour interval</label><select id="topoInt"><option value="auto" selected>Auto</option><option value="5">5 m</option><option value="10">10 m</option><option value="20">20 m</option><option value="25">25 m</option><option value="50">50 m</option><option value="100">100 m</option></select></div>
@@ -284,7 +284,9 @@ const S = {
   pos:null, acc:null, gpsAlt:null, sensorsOn:false, kind:"none",
   vec:null, locked:false, cal:{ az:0, el:0 }, calTarget:null, calMode:0, lastFix:null,
 };
-try { const c = JSON.parse(localStorage.getItem("sightline.cal")); if (c) S.cal = c; } catch(e){}
+// A landmark calibration corrects this session's compass; the compass state differs next time (seen: a 71 deg
+// correction from an earlier session carried into a new place), so it is not restored on load.
+try { localStorage.removeItem("sightline.cal"); } catch(e){}
 try { const v = localStorage.getItem("sightline.decl"); if (v !== null) $("decl").value = v; } catch(e){}
 
 /* device axes X (right), Y (top), Z (out of screen) in East-North-Up, from W3C R = Rz(alpha)·Rx(beta)·Ry(gamma).
@@ -1321,6 +1323,7 @@ function statusItems(){
     else if (!S.pos) it.push(["Skyline", "off", "Waiting for location"]);
     else if (!SKY.H) it.push(["Skyline", "busy", SKY.Hbusy ? "Computing the 25 km horizon" : "Starting"]);
     else if (fresh && L.ok && L.used) it.push(["Skyline", "ok", skyText()]);
+    else if (fresh && L.ok && L.pendingAz) it.push(["Skyline", "busy", `Found heading ${L.daz >= 0 ? "+" : ""}${L.daz.toFixed(0)}° from current, confirming with the next frame`]);
     else if (fresh && L.ok) it.push(["Skyline", "busy", "Fit disagrees with the last fix, checking"]);
     else if (fresh) it.push(["Skyline", "busy", L.why + (SKY.f.n ? " · holding last fix" : "")]);
     else it.push(["Skyline", "busy", SKY.f.n ? "Holding last fix" : "Searching"]);
@@ -1372,7 +1375,7 @@ $("bannerSet").onclick = () => {
   const trueEl = Math.atan2(T - h0 - (1 - k)*d*d/(2*RE), d)*R2D;
   S.cal = { az:((brg - m.az + 540) % 360) - 180, el:trueEl - m.el };
   S.calInfo = { at:new Date().toISOString(), target:S.calTarget.slice(), distM:Math.round(d), bearing:r3(brg), trueEl:r3(trueEl), measured:{ az:r3(m.az), el:r3(m.el) } };
-  try { localStorage.setItem("sightline.cal", JSON.stringify(S.cal)); } catch(e){}
+
   if ($("lockNorth").checked && !$("sim").checked) S.northLocked = true;
   S.calMode = 0; gCal.remove();
   toast(`Calibrated: az ${S.cal.az.toFixed(1)}°, el ${S.cal.el.toFixed(2)}° (landmark ${fmtKm(d)} away).`);
@@ -1464,141 +1467,139 @@ function solveN(M, v){                                   // Gaussian elimination
 }
 function invN(M){ const n = M.length, cols = []; for (let j = 0; j < n; j++){ const e = new Array(n).fill(0); e[j] = 1; const c = solveN(M, e); if (!c) return null; cols.push(c); } return M.map((_, i) => cols.map(c => c[i])); }
 
-/* img: {data (RGBA), width, height}; H: far horizon; A: camera axes {X,Y,Z} in ENU;
+/* Skyline solver (profile matching).
+   1. In each image column, find the top of the land: the first run of 6+ pixels clearly darker than the sky.
+   2. Turn each such pixel into a bearing and an elevation angle through the current camera pose.
+   3. Slide the terrain horizon (elevation angle per bearing, from the DEM) over all 360 deg of heading and keep the
+      heading where the residuals (image angle minus terrain angle) are most consistent (smallest MAD).
+   4. Refine heading, pitch, roll and observer height by Gauss-Newton on the inlier columns.
+   Trees and buildings make the image skyline higher than the terrain in some columns; the MAD and the inlier test
+   ignore them. Confidence = how much better the best heading is than the best one at least 10 deg away.
+   img: {data (RGBA), width, height}; H: {NA, dist, elev}; A: camera axes {X,Y,Z} in ENU;
    base: {rot, el, roll (deg), h0 (m), k, fov (long side, deg), screenAngle (deg)} */
 function skyFit(img, H, A, base){
   const t0 = performance.now(), W = img.width, Hh = img.height, px8 = img.data, N = W*Hh;
-  const L = new Float32Array(N), Bl = new Float32Array(N);
-  for (let i = 0, j = 0; i < N; i++, j += 4){ const r = px8[j], g = px8[j+1], b = px8[j+2]; L[i] = 0.299*r + 0.587*g + 0.114*b; Bl[i] = b - 0.5*(r + g); }
-  // edge score: brighter and bluer above than below, i.e. sky over ground; normalised per column
-  const E = new Float32Array(N), K = 2;
-  for (let x = 0; x < W; x++){
-    let cmax = 0;
-    for (let y = K; y < Hh - K; y++){
-      let lu = 0, ld = 0, bu = 0, bd = 0;
-      for (let t = 1; t <= K; t++){ const iu = (y - t)*W + x, id = (y + t)*W + x; lu += L[iu]; ld += L[id]; bu += Bl[iu]; bd += Bl[id]; }
-      const e = Math.max(0, (lu - ld)/K) + 0.5*Math.max(0, (bu - bd)/K);
-      E[y*W + x] = e; if (e > cmax) cmax = e;
-    }
-    const nrm = 1/(cmax + 8); for (let y = 0; y < Hh; y++) E[y*W + x] *= nrm;
-  }
-  const Eb = new Float32Array(N);                          // widened copy for the coarse search
-  for (let x = 0; x < W; x++) for (let y = 0; y < Hh; y++){
-    let m = 0; for (let t = -3; t <= 3; t++){ const yy = y + t; if (yy >= 0 && yy < Hh){ const v = E[yy*W + x]*(1 - Math.abs(t)/4); if (v > m) m = v; } }
-    Eb[y*W + x] = m;
-  }
   const out = (o) => Object.assign({ ok:false, frameW:W, frameH:Hh, ms:Math.round(performance.now() - t0) }, o);
-  const f = (Math.max(W, Hh)/2)/Math.tan(base.fov*D2R/2), cx = W/2, cy = Hh/2;
-  const th = base.screenAngle*D2R, ct = Math.cos(th), st = Math.sin(th), curv = (1 - base.k)/(2*RE);
-  const viewAz = norm360(Math.atan2(-A.Z[0], -A.Z[1])*R2D + base.rot), half = base.fov/2 + 15, stepDeg = 360/H.NA;
-  const S = [];
-  for (let i = 0; i < H.NA; i++){
-    const d = H.dist.at(i); if (d == null) continue;
-    const b = i*stepDeg; if (Math.abs(((b - viewAz + 540) % 360) - 180) > half) continue;
-    S.push({ b:b*D2R, d, T:H.elev.at(i) });
+  const Lm = new Float32Array(N), Bl = new Float32Array(N);
+  for (let i = 0, j = 0; i < N; i++, j += 4){ const r = px8[j], g = px8[j+1], b = px8[j+2]; Lm[i] = (r + g + b)/3; Bl[i] = b - 0.5*(r + g); }
+  // sky brightness: median of the top fifth of the frame
+  const topS = []; for (let y = 0; y < Hh/5; y += 2) for (let x = 0; x < W; x += 3) topS.push(Lm[y*W + x]);
+  topS.sort((p, q) => p - q); const skyLvl = topS[topS.length >> 1];
+  if (!(skyLvl > 110)) return out({ why:"sky too dark to find the skyline" });
+  const thr = Math.min(skyLvl - 45, 0.62*skyLvl), RUN = 6;
+  // skyline row per column
+  const rows = new Int32Array(W).fill(-1);
+  for (let x = 0; x < W; x++){
+    let run = 0;
+    for (let y = 0; y < Hh; y++){
+      const i = y*W + x;
+      if (Lm[i] < thr && Bl[i] < 25){ if (++run === RUN){ rows[x] = y - RUN + 1; break; } } else run = 0;
+    }
+    if (rows[x] <= 2) rows[x] = -1;                                   // land from the very top: no sky in this column
   }
-  if (S.length < 20) return out({ why:"no terrain horizon in view" });
-  // camera model, split so that per-pose trig is done once and per-sample work is a few multiplies
-  const NS = S.length, dirCache = new Map(), Qs = { cc:1, sc:0, ty:0, cr:1, sr:0, D:null };
-  const dirsFor = dz => {
-    let D = dirCache.get(dz); if (D) return D;
-    D = new Float64Array(NS*3);
-    for (let i = 0; i < NS; i++){ const sm = S[i], a = Math.atan2(sm.T - (base.h0 + dz) - curv*sm.d*sm.d, sm.d), ca = Math.cos(a); D[3*i] = Math.sin(sm.b)*ca; D[3*i+1] = Math.cos(sm.b)*ca; D[3*i+2] = Math.sin(a); }
-    dirCache.set(dz, D); return D;
-  };
-  const setQ = q => { const c = -(base.rot + q[0])*D2R, rr = (base.roll + q[2])*D2R; Qs.cc = Math.cos(c); Qs.sc = Math.sin(c); Qs.ty = f*Math.tan((base.el + q[1])*D2R); Qs.cr = Math.cos(rr); Qs.sr = Math.sin(rr); Qs.D = dirsFor(q[3]); };
+  const f = (Math.max(W, Hh)/2)/Math.tan(base.fov*D2R/2), th = base.screenAngle*D2R, ct = Math.cos(th), st = Math.sin(th);
+  const cols = []; for (let x = 0; x < W; x += 2) if (rows[x] >= 0) cols.push(x);
+  const n0 = Math.ceil(W/2);
+  if (cols.length < 40) return out({ why:"no sky-to-land edge found", n0, n:cols.length });
+  // camera rays for the skyline pixels, given pitch/roll offsets (q1, q2); returns bearing (deg, before heading) and elevation (deg)
   const AX = A.X, AY = A.Y, AZ = A.Z;
-  const projI = (i, o) => {
-    const D = Qs.D, e0 = D[3*i], n0 = D[3*i+1], u = D[3*i+2], e = e0*Qs.cc + n0*Qs.sc, n = n0*Qs.cc - e0*Qs.sc;
-    const zc = -(e*AZ[0] + n*AZ[1] + u*AZ[2]); if (zc < 0.05) return false;
-    const x = (e*AX[0] + n*AX[1] + u*AX[2])/zc, y = (e*AY[0] + n*AY[1] + u*AY[2])/zc;
-    const X0 = f*(x*ct + y*st), Y0 = -f*(-x*st + y*ct) + Qs.ty;
-    o[0] = cx + X0*Qs.cr - Y0*Qs.sr; o[1] = cy + X0*Qs.sr + Y0*Qs.cr; return true;
-  };
-  const samp = (M, x, y) => {
-    x -= 0.5; y -= 0.5;                                          // projection coords -> pixel-centre coords
-    if (x < 1 || y < 1 || x > W - 2 || y > Hh - 2) return -1;
-    const xi = x | 0, yi = y | 0, fx = x - xi, fy = y - yi, i = yi*W + xi;
-    return (M[i]*(1 - fx) + M[i+1]*fx)*(1 - fy) + (M[i+W]*(1 - fx) + M[i+W+1]*fx)*fy;
-  };
-  const o = [0, 0];
-  setQ([0, 0, 0, 0]); let n0 = 0;
-  for (let i = 0; i < NS; i++) if (projI(i, o) && o[0] >= 1 && o[0] <= W - 2 && o[1] >= 1 && o[1] <= Hh - 2) n0++;
-  if (n0 < 20) return out({ why:"the terrain horizon is outside the frame", n0 });
-  const all = [...Array(NS).keys()], Sc = all.filter(i => i % 2 === 0), minN = Math.max(12, 0.5*n0);
-  const score = (M, list, q, need) => { setQ(q); let s = 0, n = 0; for (const i of list){ if (!projI(i, o)) continue; const v = samp(M, o[0], o[1]); if (v < 0) continue; s += v; n++; } return n >= need ? s/n : -1; };
-  // coarse-to-fine search over the prior range
-  let best = [0, 0, 0, 0], bs = -1;
-  for (let a = -12; a <= 12.001; a += 0.5) for (let e = -5; e <= 5.001; e += 0.25){ const q = [a, e, 0, 0], v = score(Eb, Sc, q, minN/2); if (v > bs){ bs = v; best = q; } }
-  let s2 = -1, b2 = best;
-  for (let a = best[0] - 0.6; a <= best[0] + 0.601; a += 0.1) for (let e = best[1] - 0.4; e <= best[1] + 0.401; e += 0.1){ const q = [a, e, 0, 0], v = score(E, all, q, minN); if (v > s2){ s2 = v; b2 = q; } }
-  best = b2;
-  for (let r = -3; r <= 3.001; r += 0.25){ const q = [best[0], best[1], r, 0], v = score(E, all, q, minN); if (v > s2){ s2 = v; best = q; } }
-  for (let z = -60; z <= 60.001; z += 5) for (let e = best[1] - 0.5; e <= best[1] + 0.501; e += 0.1){ const q = [best[0], e, best[2], z], v = score(E, all, q, minN); if (v > s2){ s2 = v; best = q; } }
-  // heading peak margin: how much better the best heading is than any heading more than 1.5 deg away
-  let pk = -1, second = 0;
-  for (let a = -12; a <= 12.001; a += 0.25){ const v = score(Eb, Sc, [a, best[1], best[2], best[3]], minN/2); if (v > pk) pk = v; if (Math.abs(a - best[0]) > 1.5 && v > second) second = v; }
-  const margin = pk > 0 ? (pk - second)/pk : 0;
-  // Gauss-Newton refinement against the measured edge, robust (Huber) weights
-  const PRIOR = [1/100, 1/25, 1/9, 1/3600], DQ = [0.05, 0.05, 0.05, 1], RS = 8, KH = 1.5;
-  let q = best.slice(), meas = [], JtJ = null;
-  for (let it = 0; it < 4; it++){
-    setQ(q); const P = all.map(i => projI(i, o) ? [o[0], o[1]] : null);
-    meas = []; JtJ = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]]; const Jtr = [0, 0, 0, 0], rows = [];
-    for (let i = 0; i < NS; i++){
-      const p = P[i]; if (!p || p[0] < 2 || p[0] > W - 3) continue;
-      const xi = Math.floor(p[0]), yc = Math.floor(p[1]); let bm = 0, by = -1;
-      if (xi < 0 || xi >= W) continue;
-      for (let y = Math.max(K + 1, yc - RS); y <= Math.min(Hh - K - 2, yc + RS); y++){ const v = E[y*W + xi]; if (v > bm){ bm = v; by = y; } }
-      if (by < 0 || bm < 0.25) continue;
-      const a0 = E[(by - 1)*W + xi], a2 = E[(by + 1)*W + xi], den = a0 - 2*bm + a2;
-      const ym = by + 0.5 + (Math.abs(den) > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5*(a0 - a2)/den)) : 0);
-      const pl = i > 0 ? P[i - 1] : null, pr = i < NS - 1 ? P[i + 1] : null;
-      const slope = pl && pr && Math.abs(pr[0] - pl[0]) > 0.3 ? (pr[1] - pl[1])/(pr[0] - pl[0]) : 0;
-      rows.push({ i, p, ym, bm, slope });
+  const raysFor = (q1, q2) => {
+    const el = (base.el + q1)*D2R, rr = (base.roll + q2)*D2R, cr = Math.cos(rr), sr = Math.sin(rr), ty = f*Math.tan(el);
+    const B = new Float64Array(cols.length), E = new Float64Array(cols.length), U = new Float64Array(cols.length);
+    for (let k = 0; k < cols.length; k++){
+      const X0 = cols[k] + 0.5 - W/2, Y0 = rows[cols[k]] + 0.5 - Hh/2;
+      const Xr = X0*cr + Y0*sr, Yr = -X0*sr + Y0*cr;                     // undo the drawn roll
+      const u = Xr/f, w = -(Yr - ty)/f;                                    // undo the drawn pitch
+      const x = u*ct - w*st, y = u*st + w*ct;                              // undo the screen rotation
+      const ve = x*AX[0] + y*AY[0] - AZ[0], vn = x*AX[1] + y*AY[1] - AZ[1], vu = x*AX[2] + y*AY[2] - AZ[2];
+      B[k] = Math.atan2(ve, vn)*R2D; E[k] = Math.asin(vu/Math.hypot(ve, vn, vu))*R2D; U[k] = u;
     }
-    // Jacobian by finite differences, one pose change at a time
-    const Jc = rows.map(() => [0, 0, 0, 0]);
-    for (let j = 0; j < 4; j++){
-      const qq = q.slice(); qq[j] += DQ[j]; setQ(qq);
-      rows.forEach((rw, k) => { if (projI(rw.i, o)) Jc[k][j] = (rw.slope*(o[0] - rw.p[0]) - (o[1] - rw.p[1]))/DQ[j]; });
+    return { B, E, U };
+  };
+  // terrain horizon angle per bearing for a height offset dz
+  const NA = H.NA, step = 360/NA, curv = (1 - base.k)/(2*RE), angCache = new Map();
+  const angFor = dz => {
+    const key = Math.round(dz*10); let a = angCache.get(key); if (a) return a;
+    a = new Float64Array(NA);
+    for (let i = 0; i < NA; i++){ const d = H.dist[i]; a[i] = d == null ? NaN : Math.atan2(H.elev[i] - (base.h0 + dz) - curv*d*d, d)*R2D; }
+    angCache.set(key, a); return a;
+  };
+  const tmp = new Float64Array(cols.length);
+  const median = (arr, n) => { const v = arr.subarray(0, n).sort(); return n ? (n & 1 ? v[n >> 1] : 0.5*(v[(n >> 1) - 1] + v[n >> 1])) : NaN; };
+  const resid = (R, ang, off, outArr) => {
+    let n = 0;
+    for (let k = 0; k < R.B.length; k++){
+      let i = Math.round((R.B[k] + base.rot + off)/step) % NA; if (i < 0) i += NA;
+      const a = ang[i]; if (a === a){ outArr[n++] = R.E[k] - a; }
     }
-    rows.forEach((rw, k) => {
-      // Huber weights while converging, then Tukey (zero weight beyond 3 px) so trees and buildings poking above the
-      // terrain skyline stop pulling the fit
-      const r = rw.ym - rw.p[1], J = Jc[k], ar = Math.abs(r);
-      const w = rw.bm*(it < 2 ? (ar <= KH ? 1 : KH/ar) : (ar < 3 ? (1 - (r/3)*(r/3))**2 : 0));
-      if (w <= 0) return;
-      meas.push({ x:rw.p[0], ym:rw.ym, r, w, d:S[rw.i].d });
-      for (let a = 0; a < 4; a++){ Jtr[a] += w*J[a]*r; for (let b = 0; b < 4; b++) JtJ[a][b] += w*J[a]*J[b]; }
-    });
-    if (meas.length < 20) break;
-    const Nm = JtJ.map((row, a) => row.map((v, b) => v + (a === b ? PRIOR[a] : 0)));
-    const dq = solveN(Nm, Jtr.map(v => -v)); if (!dq) break;
-    q = q.map((v, j) => v + dq[j]);
-    q = [Math.max(-14, Math.min(14, q[0])), Math.max(-6, Math.min(6, q[1])), Math.max(-4, Math.min(4, q[2])), Math.max(-80, Math.min(80, q[3]))];
+    return n;
+  };
+  const madAt = (R, ang, off) => {
+    const n = resid(R, ang, off, tmp); if (n < 30) return { mad:Infinity, med:0, n };
+    const r = tmp.slice(0, n), med = median(tmp, n); for (let k = 0; k < n; k++) tmp[k] = Math.abs(r[k] - med);
+    return { mad:median(tmp, n), med, n };
+  };
+  // 1. coarse 360 deg heading search at the current pitch, roll and height
+  const R0 = raysFor(0, 0), ang0 = angFor(0), coarse = [];
+  for (let off = -180; off < 180; off += 0.5) coarse.push({ off, ...madAt(R0, ang0, off) });
+  let best = coarse.reduce((p, q) => q.mad < p.mad ? q : p);
+  let off = best.off;
+  for (let o = best.off - 0.6; o <= best.off + 0.6; o += 0.05){ const r = madAt(R0, ang0, o); if (r.mad < best.mad){ best = { off:o, ...r }; off = o; } }
+  const wrap = a => ((a + 540) % 360) - 180;
+  const rival = coarse.filter(c => Math.abs(wrap(c.off - off)) >= 10).reduce((p, q) => q.mad < p.mad ? q : p, { mad:Infinity, off:null });
+  const ratio = best.mad/rival.mad;
+  // 2. Gauss-Newton on the inliers for heading, pitch, roll, height
+  const inl = []; { const n = resid(R0, ang0, off, tmp); for (let k = 0, j = 0; k < R0.B.length; k++){ let i = Math.round((R0.B[k] + base.rot + off)/step) % NA; if (i < 0) i += NA; if (ang0[i] === ang0[i]){ if (Math.abs(tmp[j] - best.med) < Math.max(0.3, 2.5*best.mad)) inl.push(k); j++; } } }
+  const angInterp = (ang, b) => { const x = (((b % 360) + 360) % 360)/step, i = Math.floor(x), fr = x - i, a0 = ang[i % NA], a1 = ang[(i + 1) % NA]; return a0 === a0 && a1 === a1 ? a0 + (a1 - a0)*fr : NaN; };
+  const resVec = q => {
+    const R = raysFor(q[1], q[2]), ang = angFor(q[3]), r = [];
+    for (const k of inl){ const v = R.E[k] - angInterp(ang, R.B[k] + base.rot + q[0]); r.push(v === v ? v : 0); }
+    return r;
+  };
+  let q = [off, 0, 0, 0], C = null, rms = null;
+  const PRIOR = [0, 1/25, 1/9, 1/3600], DQ = [0.05, 0.05, 0.05, 1];
+  if (inl.length >= 30){
+    for (let it = 0; it < 6; it++){
+      const r0 = resVec(q), J = [0, 1, 2, 3].map(j => { const qq = q.slice(); qq[j] += DQ[j]; const r1 = resVec(qq); return r1.map((v, k) => (v - r0[k])/DQ[j]); });
+      const w = r0.map(v => Math.abs(v) < 0.25 ? 1 : 0.25/Math.abs(v));                // Huber
+      const Nm = [0, 1, 2, 3].map(a => [0, 1, 2, 3].map(b2 => J[a].reduce((sacc, v, k) => sacc + w[k]*v*J[b2][k], 0) + (a === b2 ? PRIOR[a] : 0)));
+      const g = [0, 1, 2, 3].map(a => -J[a].reduce((sacc, v, k) => sacc + w[k]*v*r0[k], 0));
+      const dq = solveN(Nm, g); if (!dq) break;
+      q = q.map((v, j) => v + dq[j]); q[1] = Math.max(-8, Math.min(8, q[1])); q[2] = Math.max(-6, Math.min(6, q[2])); q[3] = Math.max(-150, Math.min(150, q[3]));
+      if (Math.abs(dq[0]) < 0.005 && Math.abs(dq[1]) < 0.005) { C = invN(Nm); break; }
+      C = invN(Nm);
+    }
+    const r = resVec(q); rms = Math.sqrt(r.reduce((a, v) => a + Math.min(v*v, 0.25), 0)/r.length);
   }
-  const n = meas.length, coverage = n/n0;
-  const angs = S.map(sm => Math.atan2(sm.T - (base.h0 + q.at(3)) - curv*sm.d*sm.d, sm.d)*R2D);
-  const mean = angs.reduce((a, b) => a + b, 0)/angs.length, relief = Math.sqrt(angs.reduce((a, b) => a + (b - mean)*(b - mean), 0)/angs.length);
-  let sd = { az:99, el:99, roll:99, dz:999 }, rms = null;
-  if (n >= 20 && JtJ){
-    const sw = meas.reduce((a, m) => a + m.w, 0), s2w = meas.reduce((a, m) => a + m.w*m.r*m.r, 0)/Math.max(1, n - 4);
-    rms = Math.sqrt(meas.reduce((a, m) => a + m.w*m.r*m.r, 0)/Math.max(1e-9, sw));
-    const C = invN(JtJ.map((row, a) => row.map((v, b) => v + (a === b ? PRIOR.at(a) : 0))));
-    if (C){ const k4 = 4*s2w; sd = { az:Math.sqrt(k4*C.at(0).at(0)), el:Math.sqrt(k4*C.at(1).at(1)), roll:Math.sqrt(k4*C.at(2).at(2)), dz:Math.sqrt(k4*C.at(3).at(3)) }; }
-  }
-  setQ(q); const P = all.map(i => projI(i, o) ? [Math.round(o[0]*10)/10, Math.round(o[1]*10)/10] : null).filter(p => p && p[0] >= 0 && p[0] <= W);
+  const s2 = rms === null ? 1 : Math.max(rms*rms, 0.01);
+  const sd = C ? { az:Math.max(0.1, Math.sqrt(s2*C[0][0])), el:Math.sqrt(s2*C[1][1]), roll:Math.sqrt(s2*C[2][2]), dz:Math.sqrt(s2*C[3][3]) } : { az:99, el:99, roll:99, dz:999 };
+  // relief of the terrain horizon across the view (flat skylines cannot fix heading)
+  const angF = angFor(q[3]), Rf = raysFor(q[1], q[2]), vis = [];
+  for (let k = 0; k < Rf.B.length; k++){ const a = angInterp(angF, Rf.B[k] + base.rot + q[0]); if (a === a) vis.push(a); }
+  const mean = vis.reduce((p, v) => p + v, 0)/Math.max(1, vis.length), relief = Math.sqrt(vis.reduce((p, v) => p + (v - mean)*(v - mean), 0)/Math.max(1, vis.length));
+  const coverage = cols.length/n0, inlFrac = inl.length/Math.max(1, cols.length);
   let why = null;
-  if (n < 25) why = "too little sky edge found near the predicted skyline";
-  else if (coverage < 0.4) why = `edge found along only ${Math.round(coverage*100)}% of the skyline`;
+  if (inl.length < 40) why = "too few skyline columns match the terrain";
   else if (relief < 0.12) why = "skyline too flat to fix heading";
-  else if (margin < 0.08) why = "several headings fit equally well";
-  // heading unknown but pitch and roll still fixed: only for a genuinely flat skyline (sea, plain), never for an
-  // ambiguous one, where the pitch found is as unreliable as the heading (seen on town frames: fences, roofs)
-  const partial = why === "skyline too flat to fix heading" && n >= 25 && coverage >= 0.6 && rms !== null && rms < 1;
-  return out({ ok:!why, partial, why, daz:q.at(0), del:q.at(1), droll:q.at(2), dz:q.at(3), sd, margin, relief, n, n0, coverage, rmsPx:rms, score:s2,
-    pts:meas.map(m => [Math.round(m.x*10)/10, Math.round(m.ym*10)/10]), pred:P });
+  else if (best.mad > 0.35) why = `skyline does not match the terrain well (${best.mad.toFixed(2)}° scatter)`;
+  else if (ratio > 0.75) why = `another heading ${rival.off === null ? "" : (wrap(rival.off - off) > 0 ? "+" : "") + wrap(rival.off - off).toFixed(0) + "° away "}fits almost as well`;
+  else if (inlFrac < 0.4) why = "most of the skyline is trees or buildings";
+  const partial = why === "skyline too flat to fix heading" && inl.length >= 40 && best.mad < 0.2;
+  // overlay: detected skyline points and the fitted terrain skyline (forward projection)
+  const pts = []; for (let k = 0; k < cols.length; k += 2) pts.push([cols[k] + 0.5, rows[cols[k]] + 0.5]);
+  const pred = [], el = (base.el + q[1])*D2R, rr = (base.roll + q[2])*D2R, cr = Math.cos(rr), sr = Math.sin(rr), ty = f*Math.tan(el);
+  const c = -(base.rot + q[0])*D2R, cc = Math.cos(c), sc = Math.sin(c);
+  for (let i = 0; i < NA; i++){
+    const d = H.dist[i]; if (d == null) continue;
+    const a = angF[i]*D2R, b = i*step*D2R, ca = Math.cos(a), e0 = Math.sin(b)*ca, nn0 = Math.cos(b)*ca, u = Math.sin(a), e = e0*cc + nn0*sc, n = nn0*cc - e0*sc;
+    const zc = -(e*AZ[0] + n*AZ[1] + u*AZ[2]); if (zc < 0.05) continue;
+    const x = (e*AX[0] + n*AX[1] + u*AX[2])/zc, y = (e*AY[0] + n*AY[1] + u*AY[2])/zc;
+    const X0 = f*(x*ct + y*st), Y0 = -f*(-x*st + y*ct) + ty, px = W/2 + X0*cr - Y0*sr, py = Hh/2 + X0*sr + Y0*cr;
+    if (px >= 0 && px <= W) pred.push([Math.round(px*10)/10, Math.round(py*10)/10]);
+  }
+  pred.sort((p, s3) => p[0] - s3[0]);
+  return out({ ok:!why, partial, why, daz:wrap(q[0]), del:q[1], droll:q[2], dz:q[3], sd, margin:1 - ratio, ratio, rivalOff:rival.off === null ? null : wrap(rival.off - off),
+    mad:best.mad, relief, n:inl.length, n0, coverage, inlierFrac:inlFrac, rmsPx:rms === null ? null : rms*f*D2R, score:-best.mad, skyLvl, pts, pred });
 }
 
 function skyUpdate(res){
@@ -1611,10 +1612,21 @@ function skyUpdate(res){
     if (!first && innov*innov > 16*S2){ F[key] = z; F[vkey] = R; used++; return; }     // repeated disagreement: re-acquire
     const Kg = F[vkey]/S2; F[key] += Kg*innov; F[vkey] = Math.max(F[vkey]*(1 - Kg), R); used++;
   };
-  if (res.ok) upd("az", "vaz", F.az + res.daz, res.sd.az, 1.0, 0.02);
-  upd("el", "vel", F.el + res.del, res.sd.el, 0.6, 0.01);
-  upd("roll", "vroll", F.roll + res.droll, res.sd.roll, 1.5, 0.01);
-  if (res.ok && res.sd.dz <= 15 && S.pos){
+  if (res.ok){
+    const z = F.az + res.daz, jump = F.n ? Math.abs(((z - F.az) + 540) % 360 - 180) : Math.abs(res.daz);
+    if (jump > 8){
+      // a big change of heading (first fix, or a fix far from the current one): only accept it when the
+      // previous candidate pointed the same way, so one lucky wrong match cannot move the heading
+      const P = SKY.pendingAz, agree = P && Date.now() - P.t < 20000 && Math.abs(((z - P.z) + 540) % 360 - 180) < 3;
+      if (!agree){ SKY.pendingAz = { z, t:Date.now() }; rejected++; res.pendingAz = true; }
+      else { F.az = z; F.vaz = res.sd.az*res.sd.az; used++; SKY.pendingAz = null; }
+    } else { SKY.pendingAz = null; upd("az", "vaz", z, res.sd.az, 1.0, 0.02); }
+  }
+  if (!res.pendingAz){
+    upd("el", "vel", F.el + res.del, res.sd.el, 0.6, 0.01);
+    upd("roll", "vroll", F.roll + res.droll, res.sd.roll, 1.5, 0.01);
+  }
+  if (res.ok && !res.pendingAz && res.sd.dz <= 15 && S.pos){
     const g = elevAt(S.pos[0], S.pos[1]);
     if (g !== null){ const z = res.base.h0 + res.dz - g; if (F.hRel === null){ F.hRel = z; F.vh = res.sd.dz*res.sd.dz; used++; } else upd("hRel", "vh", z, res.sd.dz, 15, 0.2); }
   }
@@ -1643,7 +1655,7 @@ async function skyStep(){
   SKY.busy = true;
   try {
     const A = viewAxes(); if (!A) return;
-    const sc = 320/Math.max(v.videoWidth, v.videoHeight), w = Math.round(v.videoWidth*sc), h = Math.round(v.videoHeight*sc);
+    const sc = Math.min(1, 960/Math.max(v.videoWidth, v.videoHeight)), w = Math.round(v.videoWidth*sc), h = Math.round(v.videoHeight*sc);
     const c = SKY.cv || (SKY.cv = document.createElement("canvas")); c.width = w; c.height = h;
     const cx = c.getContext("2d", { willReadFrequently:true }); cx.drawImage(v, 0, 0, w, h);
     const img = cx.getImageData(0, 0, w, h), h0 = observerHeight(); if (h0 === null) return;
@@ -1881,6 +1893,7 @@ const SAVED = ["range","eye","hSource","gpsMaxErr","gpsOff","refr","uAz","uEl","
 let saved = {};
 const STORE = { raw:null, readErr:null, writeErr:null, writes:0, restored:[], mismatched:[] };
 try { STORE.raw = localStorage.getItem("sightline.settings"); saved = JSON.parse(STORE.raw) || {}; } catch(e){ STORE.readErr = String(e); }
+if (saved.fov === "66" && !saved.fovMigrated){ saved.fov = "61"; saved.fovMigrated = true; try { localStorage.setItem("sightline.settings", JSON.stringify(saved)); } catch(e){} }   // old default; captures measured ~61
 SAVED.forEach(id => {
   const el = $(id);
   el.setAttribute("autocomplete", "off");
